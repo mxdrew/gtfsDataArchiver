@@ -2,7 +2,7 @@
 # Author Information:
 # Drew Mulcare
 # github@mxdrew.com
-# May 25, 2026 (Last updated June 16, 2026)
+# May 25, 2026 (Last updated July 29, 2026)
 #
 # Description:
 # Multi-agency runner for static GTFS and optional MBTA live ingestion.
@@ -41,6 +41,7 @@
 import os
 import io
 import json
+import re
 import time
 import queue
 import zipfile
@@ -49,7 +50,7 @@ import hashlib
 import tempfile
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
 
@@ -104,11 +105,23 @@ LOCAL_TZ = ZoneInfo(env_text("SYNC_TIMEZONE"))
 LOG_LEVEL = env_text("LOG_LEVEL", "info").lower() or "info"
 
 ARCHIVE_ZSTD_LEVEL = env_int("ARCHIVE_ZSTD_LEVEL", 10)
+
+# Event-stream parquet retention. Applies only to dated event-stream archives
+# (e.g. MBTA_vehicles_07012026.parquet) directly under ARCHIVE_DIR. Static
+# GTFS tables live under ARCHIVE_DIR/gtfs/ with stable, non-dated filenames and
+# are never touched by this. Set to 0 (or a negative value) to disable cleanup.
+EVENT_RETENTION_DAYS = env_int("EVENT_RETENTION_DAYS", 30)
+
 DEFAULT_BATCH_SIZE = env_int("DEFAULT_BATCH_SIZE", 25)
 PREDICTIONS_BATCH_SIZE = env_int("PREDICTIONS_BATCH_SIZE", max(DEFAULT_BATCH_SIZE, 75))
+SNAPSHOT_RETRY_MINUTES = env_int("SNAPSHOT_RETRY_MINUTES", 10)
+
+# Tracks agencies whose snapshot pulls had failures so the scheduler can retry sooner.
+_snapshot_retry_lock = threading.Lock()
+_snapshot_retry_queue = {}  # agency_prefix -> (retry_after_datetime, agency_dict)
 
 DATA_DIR = Path("data")
-EVENTS_DIR = DATA_DIR / "archive"
+EVENTS_DIR = DATA_DIR / "events"
 ARCHIVE_DIR = DATA_DIR / "archive"
 GTFS_DIR = ARCHIVE_DIR / "gtfs"
 
@@ -148,26 +161,44 @@ AGENCIES = [
             "trips_enhanced": "https://cdn.mbta.com/realtime/TripUpdates_enhanced.json"
         }
     },
-    {"name": "BRTA", "prefix": "BRTA", "gtfs_url": "https://data.trilliumtransit.com/gtfs/berkshire-ma-us/berkshire-ma-us.zip", "enable_gtfs_static": True},
-    {"name": "BAT", "prefix": "BAT", "gtfs_url": "https://data.trilliumtransit.com/gtfs/brockton-ma-us/brockton-ma-us.zip", "enable_gtfs_static": True},
-    {"name": "CATA", "prefix": "CATA", "gtfs_url": "https://data.trilliumtransit.com/gtfs/capeann-ma-us/capeann-ma-us.zip", "enable_gtfs_static": True},
-    {"name": "CCRTA", "prefix": "CCRTA", "gtfs_url": "https://data.trilliumtransit.com/gtfs/capecod-ma-us/capecod-ma-us.zip", "enable_gtfs_static": True},
-    {"name": "FRTA", "prefix": "FRTA", "gtfs_url": "https://data.trilliumtransit.com/gtfs/frta-ma-us/frta-ma-us.zip", "enable_gtfs_static": True},
-    {"name": "GATRA", "prefix": "GATRA", "gtfs_url": "http://data.trilliumtransit.com/gtfs/gatra-ma-us/gatra-ma-us.zip", "enable_gtfs_static": True},
-    {"name": "LRTA", "prefix": "LRTA", "gtfs_url": "https://data.trilliumtransit.com/gtfs/lowell-ma-us/lowell-ma-us.zip", "enable_gtfs_static": True},
-    {"name": "MVRTA", "prefix": "MVRTA", "gtfs_url": "https://data.trilliumtransit.com/gtfs/merrimackvalley-ma-us/merrimackvalley-ma-us.zip", "enable_gtfs_static": True},
-    {"name": "MWRTA", "prefix": "MWRTA", "gtfs_url": "http://vc.mwrta.com/gtfs/google_transit.zip", "enable_gtfs_static": True},
-    {"name": "MART", "prefix": "MART", "gtfs_url": "https://data.trilliumtransit.com/gtfs/montachusett-ma-us/montachusett-ma-us.zip", "enable_gtfs_static": True},
-    {"name": "NRTA", "prefix": "NRTA", "gtfs_url": "https://nrtawave.transloc.com/Secure/Admin/Reports/GTFSDownload.aspx", "enable_gtfs_static": True},
-    {"name": "PVTA", "prefix": "PVTA", "gtfs_url": "http://www.pvta.com/g_trans/google_transit.zip", "enable_gtfs_static": True},
-    {"name": "VTA", "prefix": "VTA", "gtfs_url": "https://data.trilliumtransit.com/gtfs/marthasvineyard-ma-us/marthasvineyard-ma-us.zip", "enable_gtfs_static": True},
-    {"name": "WRTA", "prefix": "WRTA", "gtfs_url": "https://data.trilliumtransit.com/gtfs/wrta-ma-us/wrta-ma-us.zip", "enable_gtfs_static": True},
-    {"name": "SRTA", "prefix": "SRTA", "gtfs_url": "https://data.trilliumtransit.com/gtfs/srta-ma-us/srta-ma-us.zip", "enable_gtfs_static": True},
-    {"name": "YANKEE", "prefix": "YANKEE", "gtfs_url": "https://data.trilliumtransit.com/gtfs/yankeeline-ma-us/yankeeline-ma-us.zip", "enable_gtfs_static": True},
-    {"name": "MASSPORT", "prefix": "MASSPORT", "gtfs_url": "https://data.trilliumtransit.com/gtfs/massport-ma-us/massport-ma-us.zip", "enable_gtfs_static": True},
-    {"name": "LEXPRESS", "prefix": "LEXPRESS", "gtfs_url": "http://rtaalerts.com/gtfs/lexpress/google_transit.zip", "enable_gtfs_static": True},
-    {"name": "SSA", "prefix": "SSA", "gtfs_url": "https://www-steamship-assets.s3.amazonaws.com/versioned_downloadable_forms/path/2025_gtfs_copy1.zip", "enable_gtfs_static": True},
-    {"name": "HYLINE", "prefix": "HYLINE", "gtfs_url": "https://data.trilliumtransit.com/gtfs/hylinecruises-ma-us/hylinecruises-ma-us.zip", "enable_gtfs_static": True}
+    # Regional Transit Authorities
+    {"name": "BRTA",          "prefix": "BRTA",          "gtfs_url": "https://data.trilliumtransit.com/gtfs/berkshire-ma-us/berkshire-ma-us.zip",                        "enable_gtfs_static": True},
+    {"name": "BAT",           "prefix": "BAT",           "gtfs_url": "https://data.trilliumtransit.com/gtfs/brockton-ma-us/brockton-ma-us.zip",                          "enable_gtfs_static": True},
+    {"name": "CATA",          "prefix": "CATA",          "gtfs_url": "https://data.trilliumtransit.com/gtfs/capeann-ma-us/capeann-ma-us.zip",                            "enable_gtfs_static": True},
+    {"name": "CCRTA",         "prefix": "CCRTA",         "gtfs_url": "https://data.trilliumtransit.com/gtfs/capecod-ma-us/capecod-ma-us.zip",                            "enable_gtfs_static": True},
+    {"name": "FRTA",          "prefix": "FRTA",          "gtfs_url": "https://data.trilliumtransit.com/gtfs/frta-ma-us/frta-ma-us.zip",                                  "enable_gtfs_static": True},
+    {"name": "GATRA",         "prefix": "GATRA",         "gtfs_url": "https://data.trilliumtransit.com/gtfs/gatra-ma-us/gatra-ma-us.zip",                                "enable_gtfs_static": True},
+    {"name": "LRTA",          "prefix": "LRTA",          "gtfs_url": "https://data.trilliumtransit.com/gtfs/lowell-ma-us/lowell-ma-us.zip",                              "enable_gtfs_static": True},
+    {"name": "MVRTA",         "prefix": "MVRTA",         "gtfs_url": "https://data.trilliumtransit.com/gtfs/merrimackvalley-ma-us/merrimackvalley-ma-us.zip",             "enable_gtfs_static": True},
+    {"name": "MWRTA",         "prefix": "MWRTA",         "gtfs_url": "http://vc.mwrta.com/gtfs/google_transit.zip",                                                      "enable_gtfs_static": True},
+    {"name": "MART",          "prefix": "MART",          "gtfs_url": "https://data.trilliumtransit.com/gtfs/montachusett-ma-us/montachusett-ma-us.zip",                  "enable_gtfs_static": True},
+    {"name": "NRTA",          "prefix": "NRTA",          "gtfs_url": "https://data.trilliumtransit.com/gtfs/nantucket-ma-us/nantucket-ma-us.zip",                        "enable_gtfs_static": True},
+    {"name": "PVTA",          "prefix": "PVTA",          "gtfs_url": "http://www.pvta.com/g_trans/google_transit.zip",                                                    "enable_gtfs_static": True},
+    {"name": "VTA",           "prefix": "VTA",           "gtfs_url": "https://data.trilliumtransit.com/gtfs/marthasvineyard-ma-us/marthasvineyard-ma-us.zip",             "enable_gtfs_static": True},
+    {"name": "WRTA",          "prefix": "WRTA",          "gtfs_url": "https://data.trilliumtransit.com/gtfs/wrta-ma-us/wrta-ma-us.zip",                                  "enable_gtfs_static": True},
+    {"name": "SRTA",          "prefix": "SRTA",          "gtfs_url": "https://data.trilliumtransit.com/gtfs/srta-ma-us/srta-ma-us.zip",                                  "enable_gtfs_static": True},
+    # Private bus carriers
+    {"name": "YANKEE",        "prefix": "YANKEE",        "gtfs_url": "https://data.trilliumtransit.com/gtfs/yankeeline-ma-us/yankeeline-ma-us.zip",                      "enable_gtfs_static": True},
+    {"name": "COACH",         "prefix": "COACH",         "gtfs_url": "https://data.trilliumtransit.com/gtfs/coachcompany-ma-us/coachcompany-ma-us.zip",                  "enable_gtfs_static": True},
+    {"name": "DATTCO",        "prefix": "DATTCO",        "gtfs_url": "https://data.trilliumtransit.com/gtfs/dattco-ma-us/dattco-ma-us.zip",                              "enable_gtfs_static": True},
+    {"name": "PETERPAN",      "prefix": "PETERPAN",      "gtfs_url": "https://data.trilliumtransit.com/gtfs/peterpan-ma-us/peterpan-ma-us.zip",                          "enable_gtfs_static": True},
+    {"name": "PBSC",          "prefix": "PBSC",          "gtfs_url": "https://data.trilliumtransit.com/gtfs/plymouthbrockton-ma-us/plymouthbrockton-ma-us.zip",           "enable_gtfs_static": True},
+    # Massport / Logan Express
+    {"name": "MASSPORT",      "prefix": "MASSPORT",      "gtfs_url": "https://data.trilliumtransit.com/gtfs/massport-ma-us/massport-ma-us.zip",                      "enable_gtfs_static": True},
+    # Ferry services
+    {"name": "BAYSTATE",      "prefix": "BAYSTATE",      "gtfs_url": "https://data.trilliumtransit.com/gtfs/baystatecruisecompany-ma-us/baystatecruisecompany-ma-us.zip", "enable_gtfs_static": True},
+    {"name": "BLOCKISLAND",   "prefix": "BLOCKISLAND",   "gtfs_url": "https://data.trilliumtransit.com/gtfs/blockislandferry-ri-us/blockislandferry-ri-us.zip",           "enable_gtfs_static": True},
+    {"name": "CUTTYHUNK",     "prefix": "CUTTYHUNK",     "gtfs_url": "https://data.trilliumtransit.com/gtfs/cuttyhunkferryco-ma-us/cuttyhunkferryco-ma-us.zip",           "enable_gtfs_static": True},
+    {"name": "FREEDOMCRUISE", "prefix": "FREEDOMCRUISE", "gtfs_url": "https://data.trilliumtransit.com/gtfs/freedomcruiseline-ma-us/freedomcruiseline-ma-us.zip",         "enable_gtfs_static": True},
+    {"name": "HYLINE",        "prefix": "HYLINE",        "gtfs_url": "https://data.trilliumtransit.com/gtfs/hylinecruises-ma-us/hylinecruises-ma-us.zip",                "enable_gtfs_static": True},
+    {"name": "PATRIOT",       "prefix": "PATRIOT",       "gtfs_url": "https://data.trilliumtransit.com/gtfs/patriotpartyboats-ma-us/patriotpartyboats-ma-us.zip",         "enable_gtfs_static": True},
+    {"name": "SEASTREAK",     "prefix": "SEASTREAK",     "gtfs_url": "http://seastreak.com/api/transit/google_transit.zip",                                               "enable_gtfs_static": True},
+    {"name": "VINEYARDFAST",  "prefix": "VINEYARDFAST",  "gtfs_url": "https://data.trilliumtransit.com/gtfs/vineyardfastferry-ri-us/vineyardfastferry-ri-us.zip",         "enable_gtfs_static": True},
+    {"name": "SSA",           "prefix": "SSA",           "gtfs_url": "https://www-steamship-assets.s3.amazonaws.com/versioned_downloadable_forms/path/2025_gtfs_copy1.zip", "enable_gtfs_static": True},
+    # Local bus routes
+    {"name": "LEXPRESS",      "prefix": "LEXPRESS",      "gtfs_url": "http://rtaalerts.com/gtfs/lexpress/google_transit.zip",                                             "enable_gtfs_static": True},
+    # AMTRAK
+    {"name": "AMTRAK",        "prefix": "AMTRAK",        "gtfs_url": "https://content.amtrak.com/content/gtfs/GTFS.zip",                                                   "enable_gtfs_static": True},
 ]
 
 
@@ -384,7 +415,23 @@ def _align_table_to_schema(table, schema):
 
 def parquet_compaction_worker():
     # Streams ALL orphaned/yesterday's JSONL files into Parquet and removes the source after success.
+    # On startup: removes stale .tmp files left by compaction runs that were interrupted by a
+    # container crash. Any .tmp older than 2 hours is safe to delete (a live compaction write
+    # never takes that long).
     log("Parquet compaction watchdog and recovery sweep active.")
+    _STALE_TMP_AGE = 7200  # seconds (2 hours)
+    now_ts = time.time()
+    swept = []
+    for tmp_file in ARCHIVE_DIR.glob("*.tmp"):
+        try:
+            if now_ts - tmp_file.stat().st_mtime > _STALE_TMP_AGE:
+                tmp_file.unlink()
+                swept.append(tmp_file.name)
+        except Exception:
+            pass
+    if swept:
+        log(f"Startup sweep: removed {len(swept)} stale .tmp file(s): {', '.join(swept)}")
+
     while not stop_event.is_set():
         try:
             today_str = datetime.now(LOCAL_TZ).strftime("%m%d%Y")
@@ -449,12 +496,60 @@ def parquet_compaction_worker():
                                 temp_path.unlink()
                             except Exception:
                                 pass
+            cleanup_old_event_parquets()
         except Exception as e:
             log(f"Compaction thread error: {e}", is_error=True)
             
         for _ in range(60):
             if stop_event.is_set(): break
             time.sleep(1)
+
+
+# Matches the dated event-stream parquet naming convention, e.g.
+# "MBTA_vehicles_07012026.parquet" -> month=07, day=01, year=2026.
+_EVENT_PARQUET_DATE_RE = re.compile(r"_(\d{2})(\d{2})(\d{4})\.parquet$")
+
+
+def cleanup_old_event_parquets():
+    """Deletes compacted event-stream parquet archives older than EVENT_RETENTION_DAYS.
+
+    Only ever considers dated files sitting directly in ARCHIVE_DIR (event streams
+    like vehicles, alerts, predictions, stop_events, and the hourly snapshot
+    endpoints, across every agency). Static GTFS tables live in ARCHIVE_DIR/gtfs/
+    under stable, non-dated filenames (AGENCY_gtfs_<table>.parquet); the
+    non-recursive glob below never descends into that subdirectory, and the
+    "_gtfs_" name check below is a second, defensive guard against ever
+    deleting a static table.
+    """
+    if EVENT_RETENTION_DAYS <= 0:
+        return
+
+    cutoff_date = (datetime.now(LOCAL_TZ) - timedelta(days=EVENT_RETENTION_DAYS)).date()
+    removed = []
+
+    for file in ARCHIVE_DIR.glob("*.parquet"):
+        if "_gtfs_" in file.name:
+            continue  # static GTFS tables never expire
+
+        match = _EVENT_PARQUET_DATE_RE.search(file.name)
+        if not match:
+            continue  # unrecognized filename shape; leave it alone rather than guess
+
+        month_str, day_str, year_str = match.groups()
+        try:
+            file_date = datetime(int(year_str), int(month_str), int(day_str)).date()
+        except ValueError:
+            continue
+
+        if file_date < cutoff_date:
+            try:
+                file.unlink()
+                removed.append(file.name)
+            except Exception as e:
+                log(f"Failed to remove expired parquet {file.name}: {e}", is_warning=True)
+
+    if removed:
+        log(f"Retention sweep: removed {len(removed)} event parquet(s) older than {EVENT_RETENTION_DAYS} days.")
 
 
 #### NETWORK CONSUMERS ####
@@ -568,22 +663,84 @@ def enhanced_poller(agency, endpoint, url):
 
 def fetch_snapshots(agency):
     # Pulls contextual snapshots for specific agency endpoints.
-    # NOTE (Task #29 fix): The MBTA V3 API rejects unfiltered GET /trips requests
-    # (HTTP 400 — requires filter[route], filter[id], filter[route_pattern], or filter[name]).
-    # We special-case "trips" here: fetch all route IDs first, then pull trips in batches.
+    # The MBTA V3 API rejects unfiltered requests for several endpoints with HTTP 400.
+    # For those endpoints we fetch all route IDs first and pull in batches using
+    # filter[route] — the same approach used to fix trips (Task #29).
+    # Confirmed via curl: schedules, shapes, services, and trips all require filter[route].
+    #
+    # Retry behavior: each GET is retried up to 3 times on 5xx / connection errors,
+    # with 30s then 60s backoff. If any endpoint still fails after all retries, the
+    # agency is queued for a full retry in SNAPSHOT_RETRY_MINUTES (default 10).
     if not agency.get("base_url") or not agency.get("snapshot_eps"):
         return
     log("Pulling hourly snapshots...", agency_log_label=agency["prefix"])
     headers = {"Accept": "application/json"}
     if agency.get("api_key"): headers["X-API-Key"] = agency["api_key"]
 
-    # Endpoints that require a filter parameter — maps endpoint name → filter key.
-    # "trips" is auto-detected; override via agency["snapshot_eps_filtered"] if needed.
-    REQUIRE_ROUTE_FILTER = set(agency.get("snapshot_eps_require_route_filter", ["trips"]))
+    # Endpoints that require filter[route] — all confirmed to return HTTP 400 unfiltered.
+    # Override per-agency via agency["snapshot_eps_require_route_filter"] if needed.
+    REQUIRE_ROUTE_FILTER = set(agency.get("snapshot_eps_require_route_filter", ["trips", "schedules", "shapes", "services"]))
+
+    # Endpoints that require a non-route filter, mapped to (source_resource, filter_param).
+    # live_facilities requires filter[id] using facility IDs fetched from /facilities.
+    # Override per-agency via agency["snapshot_eps_require_id_filter"] if needed.
+    REQUIRE_ID_FILTER = agency.get("snapshot_eps_require_id_filter", {
+        "live_facilities": ("facilities", "filter[id]"),
+    })
+
+    # Retry on transient 5xx/connection errors: 3 attempts total with increasing backoff.
+    _RETRY_DELAYS = [30, 60]  # seconds before 2nd and 3rd attempt
+
+    def _get_with_retry(url, params=None):
+        max_attempts = len(_RETRY_DELAYS) + 1
+        for attempt in range(max_attempts):
+            if stop_event.is_set():
+                return None
+            err_msg = None
+            try:
+                res = requests.get(url, headers=headers, params=params, timeout=30)
+            except Exception as e:
+                err_msg = str(e)
+            else:
+                if res.status_code == 200:
+                    return res
+                if res.status_code < 500:
+                    # 4xx errors are configuration problems — don't retry.
+                    log(
+                        f"Snapshot returned HTTP {res.status_code}: {url}",
+                        agency_log_label=agency["prefix"], is_warning=True,
+                    )
+                    return None
+                err_msg = f"HTTP {res.status_code}"
+
+            is_last = attempt >= len(_RETRY_DELAYS)
+            if is_last:
+                log(
+                    f"Snapshot failed ({err_msg}), all {max_attempts} attempts exhausted: {url}",
+                    agency_log_label=agency["prefix"], is_warning=True,
+                )
+                return None
+            delay = _RETRY_DELAYS[attempt]
+            log(
+                f"Snapshot failed ({err_msg}), retrying in {delay}s "
+                f"(attempt {attempt + 1}/{max_attempts}): {url}",
+                agency_log_label=agency["prefix"], is_warning=True,
+            )
+            # Interruptible sleep so the container shuts down cleanly.
+            for _ in range(delay):
+                if stop_event.is_set():
+                    return None
+                time.sleep(1)
+        return None
+
+    any_failed = False
+    endpoint_counts = {}  # endpoint -> record count written (None = failed)
 
     for endpoint in agency.get("snapshot_eps", []):
         if stop_event.is_set():
             break
+        count = 0
+        ep_failed = False
         try:
             if endpoint in REQUIRE_ROUTE_FILTER:
                 # Fetch route IDs then pull per-route batch to satisfy the API filter requirement.
@@ -593,45 +750,96 @@ def fetch_snapshots(agency):
                         f"Skipping {endpoint} snapshot: could not retrieve route IDs",
                         agency_log_label=agency["prefix"], is_warning=True,
                     )
+                    any_failed = True
+                    endpoint_counts[endpoint] = None
                     continue
                 batch_size = DEFAULT_BATCH_SIZE
                 for i in range(0, len(route_ids), batch_size):
                     if stop_event.is_set():
                         break
                     batch = route_ids[i : i + batch_size]
-                    try:
-                        res = requests.get(
-                            f"{agency['base_url']}/{endpoint}",
-                            headers=headers,
-                            params={"filter[route]": ",".join(batch)},
-                            timeout=30,
-                        )
-                        if res.status_code == 200:
-                            for r in res.json().get("data", []):
-                                write_queue.put((agency["prefix"], endpoint, "snapshot", r))
-                        else:
-                            log(
-                                f"Snapshot {endpoint} returned HTTP {res.status_code}",
-                                agency_log_label=agency["prefix"], is_warning=True,
-                            )
-                    except Exception as e:
-                        log(
-                            f"Snapshot batch failed for {endpoint}: {e}",
-                            agency_log_label=agency["prefix"], is_warning=True,
-                        )
+                    res = _get_with_retry(
+                        f"{agency['base_url']}/{endpoint}",
+                        params={"filter[route]": ",".join(batch)},
+                    )
+                    if res is not None:
+                        for r in res.json().get("data", []):
+                            write_queue.put((agency["prefix"], endpoint, "snapshot", r))
+                            count += 1
+                    else:
+                        ep_failed = True
+            elif endpoint in REQUIRE_ID_FILTER:
+                # Fetch resource IDs first, then batch using the endpoint-specific filter param.
+                source_resource, filter_param = REQUIRE_ID_FILTER[endpoint]
+                ids = fetch_api_ids(agency, source_resource)
+                if not ids:
+                    log(
+                        f"Skipping {endpoint} snapshot: could not retrieve {source_resource} IDs",
+                        agency_log_label=agency["prefix"], is_warning=True,
+                    )
+                    any_failed = True
+                    endpoint_counts[endpoint] = None
+                    continue
+                batch_size = DEFAULT_BATCH_SIZE
+                for i in range(0, len(ids), batch_size):
+                    if stop_event.is_set():
+                        break
+                    batch = ids[i : i + batch_size]
+                    res = _get_with_retry(
+                        f"{agency['base_url']}/{endpoint}",
+                        params={filter_param: ",".join(batch)},
+                    )
+                    if res is not None:
+                        for r in res.json().get("data", []):
+                            write_queue.put((agency["prefix"], endpoint, "snapshot", r))
+                            count += 1
+                    else:
+                        ep_failed = True
             else:
-                res = requests.get(f"{agency['base_url']}/{endpoint}", headers=headers, timeout=30)
-                if res.status_code == 200:
+                res = _get_with_retry(f"{agency['base_url']}/{endpoint}")
+                if res is not None:
                     for r in res.json().get("data", []):
                         write_queue.put((agency["prefix"], endpoint, "snapshot", r))
-        except Exception: pass
+                        count += 1
+                else:
+                    ep_failed = True
+        except Exception:
+            ep_failed = True
 
-def fetch_gtfs_static(agency):
+        if ep_failed:
+            any_failed = True
+            endpoint_counts[endpoint] = None
+        else:
+            endpoint_counts[endpoint] = count
+
+    # Summary log so it's clear what succeeded and what didn't.
+    ok = [f"{ep}={ct}" for ep, ct in endpoint_counts.items() if ct is not None]
+    fail = [ep for ep, ct in endpoint_counts.items() if ct is None]
+    if ok:
+        log(f"Snapshots OK: {', '.join(ok)}", agency_log_label=agency["prefix"])
+    if fail:
+        log(f"Snapshots FAILED: {', '.join(fail)}", agency_log_label=agency["prefix"], is_warning=True)
+
+    if any_failed and not stop_event.is_set():
+        retry_after = datetime.now(LOCAL_TZ) + timedelta(minutes=SNAPSHOT_RETRY_MINUTES)
+        with _snapshot_retry_lock:
+            _snapshot_retry_queue[agency["prefix"]] = (retry_after, agency)
+        log(
+            f"Some snapshots failed — scheduled retry in {SNAPSHOT_RETRY_MINUTES} min",
+            agency_log_label=agency["prefix"], is_warning=True,
+        )
+
+def fetch_gtfs_static(agency, skip_if_cached=False):
     # Downloads GTFS zip, deduplicates rows, and updates first/last seen dates.
+    # skip_if_cached=True (startup): skips the download if parquet files already exist
+    # for this agency — they'll be refreshed at the next scheduled 3AM/3PM run instead.
     if not agency.get("gtfs_url"):
         return
-    
+
     prefix = agency["prefix"]
+    if skip_if_cached and list(GTFS_DIR.glob(f"{prefix}_gtfs_*.parquet")):
+        return
+
     log("Pulling static GTFS assets...", agency_log_label=prefix)
     try:
         res = requests.get(agency["gtfs_url"], headers=GTFS_DOWNLOAD_HEADERS, timeout=120)
@@ -669,27 +877,38 @@ def fetch_gtfs_static(agency):
 
 def scheduler_thread():
     # Triggers hourly and daily automated tasks for all agencies using ThreadPoolExecutor.
+    # Also drains _snapshot_retry_queue: agencies with failed snapshots are retried after
+    # SNAPSHOT_RETRY_MINUTES rather than waiting until the next top-of-hour run.
     last_snapshot_hour = -1
     last_gtfs_pull = -1
     executor = ThreadPoolExecutor(max_workers=4)
-    
+
     while not stop_event.is_set():
         now = datetime.now(LOCAL_TZ)
-        
+
         # Hourly REST Snapshots
         if now.hour != last_snapshot_hour and now.minute == 0:
             for agency in AGENCIES:
                 if agency.get("enable_snapshot_pulls"):
                     executor.submit(fetch_snapshots, agency)
             last_snapshot_hour = now.hour
-            
+
+        # Retry snapshots that failed in a previous run (sooner than next top-of-hour).
+        with _snapshot_retry_lock:
+            due = [(prefix, retry_at, ag) for prefix, (retry_at, ag) in _snapshot_retry_queue.items() if now >= retry_at]
+            for prefix, _, _ in due:
+                del _snapshot_retry_queue[prefix]
+        for prefix, _, ag in due:
+            log(f"Retrying failed snapshots", agency_log_label=prefix)
+            executor.submit(fetch_snapshots, ag)
+
         # Static GTFS Pulls at 3AM and 3PM
         if now.hour in [3, 15] and now.hour != last_gtfs_pull:
             for agency in AGENCIES:
                 if agency.get("enable_gtfs_static"):
                     executor.submit(fetch_gtfs_static, agency)
             last_gtfs_pull = now.hour
-            
+
         time.sleep(10)
 
 
@@ -708,7 +927,7 @@ if __name__ == "__main__":
             if agency.get("enable_snapshot_pulls"):
                 threading.Thread(target=fetch_snapshots, args=(agency,), daemon=True).start()
             if agency.get("enable_gtfs_static"):
-                threading.Thread(target=fetch_gtfs_static, args=(agency,), daemon=True).start()
+                threading.Thread(target=fetch_gtfs_static, args=(agency,), kwargs={"skip_if_cached": True}, daemon=True).start()
             
             # Deploy Base Streams
             if agency.get("enable_base_streams"):

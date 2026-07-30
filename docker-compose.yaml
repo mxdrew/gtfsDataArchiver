@@ -31,5 +31,6 @@ services:
       - DEFAULT_BATCH_SIZE=25
       - LOG_LEVEL=warning
       - ARCHIVE_ZSTD_LEVEL=10
+      - EVENT_RETENTION_DAYS=30
     volumes:
       - ./data:/app/data

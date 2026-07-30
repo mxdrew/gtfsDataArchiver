@@ -15,5 +15,5 @@ __pycache__/
 
 docker-compose-*.yaml
 
-otherScripts/*.env
-otherScripts/*_dmm.*
+otherScripts/*
+!otherScripts/ma_gtfs_archiver.py

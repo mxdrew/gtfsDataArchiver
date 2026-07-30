@@ -2,7 +2,7 @@
 # Author Information:
 # Drew Mulcare
 # github@mxdrew.com
-# May 25, 2026 (Last updated June 11, 2026)
+# May 25, 2026 (Last updated July 29, 2026)
 #
 # Description:
 # Lightweight, single-process data ingestion engine for real-time and static transit feeds. 
@@ -50,7 +50,7 @@ import threading
 import hashlib
 import tempfile
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
@@ -158,9 +158,20 @@ if ENABLE_ENHANCED_STREAMS:
 # Tuning Parameters
 DEFAULT_BATCH_SIZE = env_int("DEFAULT_BATCH_SIZE", 25)
 PREDICTIONS_BATCH_SIZE = env_int("PREDICTIONS_BATCH_SIZE", max(DEFAULT_BATCH_SIZE, 75))
+SNAPSHOT_RETRY_MINUTES = env_int("SNAPSHOT_RETRY_MINUTES", 10)
+
+# Retry tracking: set to a future datetime when fetch_snapshots has failures; cleared by scheduler.
+_snapshot_retry_lock = threading.Lock()
+_snapshot_retry_at = None  # datetime | None
 ENHANCED_POLL_INTERVAL_SECONDS = env_float("ENHANCED_POLL_INTERVAL_SECONDS", 7)
 ARCHIVE_ZSTD_LEVEL = env_int("ARCHIVE_ZSTD_LEVEL", 10)
 LOG_LEVEL = env_text("LOG_LEVEL", "info").lower() or "info"
+
+# Event-stream parquet retention. Applies only to dated event-stream archives
+# (e.g. AGENCY_vehicles_07012026.parquet) directly under ARCHIVE_DIR. Static
+# GTFS tables live under ARCHIVE_DIR/gtfs/ with stable, non-dated filenames and
+# are never touched by this. Set to 0 (or a negative value) to disable cleanup.
+EVENT_RETENTION_DAYS = env_int("EVENT_RETENTION_DAYS", 30)
 
 write_queue = queue.Queue(maxsize=500000)
 stop_event = threading.Event()
@@ -368,8 +379,23 @@ def writer_worker():
             f.close()
 
 def parquet_compaction_worker():
-    """Streams orphaned/yesterday's JSONL files into Parquet and removes the source after success."""
+    # Streams orphaned/yesterday's JSONL files into Parquet and removes the source after success.
+    # On startup: removes stale .tmp files left by compaction runs that were interrupted by a
+    # container crash. Any .tmp older than 2 hours is safe to delete.
     log("Parquet compaction watchdog and recovery sweep active.")
+    _STALE_TMP_AGE = 7200  # seconds (2 hours)
+    now_ts = time.time()
+    swept = []
+    for tmp_file in ARCHIVE_DIR.glob("*.tmp"):
+        try:
+            if now_ts - tmp_file.stat().st_mtime > _STALE_TMP_AGE:
+                tmp_file.unlink()
+                swept.append(tmp_file.name)
+        except Exception:
+            pass
+    if swept:
+        log(f"Startup sweep: removed {len(swept)} stale .tmp file(s): {', '.join(swept)}")
+
     while not stop_event.is_set():
         try:
             today_str = datetime.now(LOCAL_TZ).strftime("%m%d%Y")
@@ -431,12 +457,58 @@ def parquet_compaction_worker():
                                 temp_path.unlink()
                             except Exception:
                                 pass
+            cleanup_old_event_parquets()
         except Exception as e:
             log(f"Compaction thread error: {e}", is_error=True)
             
         for _ in range(60):
             if stop_event.is_set(): break
             time.sleep(1)
+
+# Matches the dated event-stream parquet naming convention, e.g.
+# "MBTA_vehicles_07012026.parquet" -> month=07, day=01, year=2026.
+_EVENT_PARQUET_DATE_RE = re.compile(r"_(\d{2})(\d{2})(\d{4})\.parquet$")
+
+
+def cleanup_old_event_parquets():
+    """Deletes compacted event-stream parquet archives older than EVENT_RETENTION_DAYS.
+
+    Only ever considers dated files sitting directly in ARCHIVE_DIR (event streams
+    like vehicles, alerts, predictions, stop_events, and the hourly snapshot
+    endpoints). Static GTFS tables live in ARCHIVE_DIR/gtfs/ under stable,
+    non-dated filenames (AGENCY_gtfs_<table>.parquet); the non-recursive glob
+    below never descends into that subdirectory, and the "_gtfs_" name check
+    below is a second, defensive guard against ever deleting a static table.
+    """
+    if EVENT_RETENTION_DAYS <= 0:
+        return
+
+    cutoff_date = (datetime.now(LOCAL_TZ) - timedelta(days=EVENT_RETENTION_DAYS)).date()
+    removed = []
+
+    for file in ARCHIVE_DIR.glob("*.parquet"):
+        if "_gtfs_" in file.name:
+            continue  # static GTFS tables never expire
+
+        match = _EVENT_PARQUET_DATE_RE.search(file.name)
+        if not match:
+            continue  # unrecognized filename shape; leave it alone rather than guess
+
+        month_str, day_str, year_str = match.groups()
+        try:
+            file_date = datetime(int(year_str), int(month_str), int(day_str)).date()
+        except ValueError:
+            continue
+
+        if file_date < cutoff_date:
+            try:
+                file.unlink()
+                removed.append(file.name)
+            except Exception as e:
+                log(f"Failed to remove expired parquet {file.name}: {e}", is_warning=True)
+
+    if removed:
+        log(f"Retention sweep: removed {len(removed)} event parquet(s) older than {EVENT_RETENTION_DAYS} days.")
 
 #### NETWORK CONSUMERS ####
 
@@ -549,27 +621,161 @@ def enhanced_poller(endpoint, url):
 #### SCHEDULER TASKS ####
 
 def fetch_snapshots():
-    """Runs hourly. Pulls contextual snapshots for all endpoints."""
+    # Pulls contextual snapshots for all configured endpoints.
+    # The MBTA V3 API rejects unfiltered requests for several endpoints with HTTP 400.
+    # For those endpoints we fetch all route IDs first and pull in batches using
+    # filter[route] — confirmed via curl: schedules, shapes, services, and trips all
+    # require filter[route] and return HTTP 400 without it.
+    #
+    # Retry behavior: each GET is retried up to 3 times on 5xx / connection errors,
+    # with 30s then 60s backoff. If any endpoint still fails after all retries, a full
+    # retry is scheduled in SNAPSHOT_RETRY_MINUTES (default 10) via the scheduler.
+    global _snapshot_retry_at
     if not BASE_URL or not ENABLE_SNAPSHOT_PULLS:
         return
     log("Pulling hourly snapshots...")
     headers = {"Accept": "application/json"}
     if API_KEY: headers["X-API-Key"] = API_KEY
 
-    # Snapshot endpoints are pulled once each so the stream toggles remain independent.
+    # Endpoints confirmed to require filter[route] — fetched in per-route batches.
+    REQUIRE_ROUTE_FILTER = {"trips", "schedules", "shapes", "services"}
+
+    # Endpoints requiring a non-route filter, mapped to (source_resource, filter_param).
+    # live_facilities requires filter[id] using facility IDs fetched from /facilities.
+    REQUIRE_ID_FILTER = {
+        "live_facilities": ("facilities", "filter[id]"),
+    }
+
+    # Retry on transient 5xx/connection errors: 3 attempts total with increasing backoff.
+    _RETRY_DELAYS = [30, 60]  # seconds before 2nd and 3rd attempt
+
+    def _get_with_retry(url, params=None):
+        max_attempts = len(_RETRY_DELAYS) + 1
+        for attempt in range(max_attempts):
+            if stop_event.is_set():
+                return None
+            err_msg = None
+            try:
+                res = requests.get(url, headers=headers, params=params, timeout=30)
+            except Exception as e:
+                err_msg = str(e)
+            else:
+                if res.status_code == 200:
+                    return res
+                if res.status_code < 500:
+                    # 4xx errors are configuration problems — don't retry.
+                    log(f"Snapshot returned HTTP {res.status_code}: {url}", is_warning=True)
+                    return None
+                err_msg = f"HTTP {res.status_code}"
+
+            is_last = attempt >= len(_RETRY_DELAYS)
+            if is_last:
+                log(f"Snapshot failed ({err_msg}), all {max_attempts} attempts exhausted: {url}", is_warning=True)
+                return None
+            delay = _RETRY_DELAYS[attempt]
+            log(
+                f"Snapshot failed ({err_msg}), retrying in {delay}s "
+                f"(attempt {attempt + 1}/{max_attempts}): {url}",
+                is_warning=True,
+            )
+            # Interruptible sleep so the container shuts down cleanly.
+            for _ in range(delay):
+                if stop_event.is_set():
+                    return None
+                time.sleep(1)
+        return None
+
+    any_failed = False
+    endpoint_counts = {}  # endpoint -> record count written (None = failed)
+
     for endpoint in SNAPSHOT_EPS:
         if stop_event.is_set():
             break
+        count = 0
+        ep_failed = False
         try:
-            res = requests.get(f"{BASE_URL}/{endpoint}", headers=headers, timeout=30)
-            if res.status_code == 200:
-                for r in res.json().get("data", []):
-                    write_queue.put((endpoint, "snapshot", r))
-        except Exception: pass
+            if endpoint in REQUIRE_ROUTE_FILTER:
+                # Fetch route IDs then pull per-route batch to satisfy the API filter requirement.
+                route_ids = fetch_api_ids("routes")
+                if not route_ids:
+                    log(f"Skipping {endpoint} snapshot: could not retrieve route IDs", is_warning=True)
+                    any_failed = True
+                    endpoint_counts[endpoint] = None
+                    continue
+                for i in range(0, len(route_ids), DEFAULT_BATCH_SIZE):
+                    if stop_event.is_set():
+                        break
+                    batch = route_ids[i : i + DEFAULT_BATCH_SIZE]
+                    res = _get_with_retry(
+                        f"{BASE_URL}/{endpoint}",
+                        params={"filter[route]": ",".join(batch)},
+                    )
+                    if res is not None:
+                        for r in res.json().get("data", []):
+                            write_queue.put((endpoint, "snapshot", r))
+                            count += 1
+                    else:
+                        ep_failed = True
+            elif endpoint in REQUIRE_ID_FILTER:
+                # Fetch resource IDs first, then batch using the endpoint-specific filter param.
+                source_resource, filter_param = REQUIRE_ID_FILTER[endpoint]
+                ids = fetch_api_ids(source_resource)
+                if not ids:
+                    log(f"Skipping {endpoint} snapshot: could not retrieve {source_resource} IDs", is_warning=True)
+                    any_failed = True
+                    endpoint_counts[endpoint] = None
+                    continue
+                for i in range(0, len(ids), DEFAULT_BATCH_SIZE):
+                    if stop_event.is_set():
+                        break
+                    batch = ids[i : i + DEFAULT_BATCH_SIZE]
+                    res = _get_with_retry(
+                        f"{BASE_URL}/{endpoint}",
+                        params={filter_param: ",".join(batch)},
+                    )
+                    if res is not None:
+                        for r in res.json().get("data", []):
+                            write_queue.put((endpoint, "snapshot", r))
+                            count += 1
+                    else:
+                        ep_failed = True
+            else:
+                res = _get_with_retry(f"{BASE_URL}/{endpoint}")
+                if res is not None:
+                    for r in res.json().get("data", []):
+                        write_queue.put((endpoint, "snapshot", r))
+                        count += 1
+                else:
+                    ep_failed = True
+        except Exception:
+            ep_failed = True
 
-def fetch_gtfs_static():
-    """Runs twice a day. Downloads GTFS zip, deduplicates rows, and updates first/last seen dates."""
+        if ep_failed:
+            any_failed = True
+            endpoint_counts[endpoint] = None
+        else:
+            endpoint_counts[endpoint] = count
+
+    # Summary log so it's clear what succeeded and what didn't.
+    ok = [f"{ep}={ct}" for ep, ct in endpoint_counts.items() if ct is not None]
+    fail = [ep for ep, ct in endpoint_counts.items() if ct is None]
+    if ok:
+        log(f"Snapshots OK: {', '.join(ok)}")
+    if fail:
+        log(f"Snapshots FAILED: {', '.join(fail)}", is_warning=True)
+
+    if any_failed and not stop_event.is_set():
+        with _snapshot_retry_lock:
+            _snapshot_retry_at = datetime.now(LOCAL_TZ) + timedelta(minutes=SNAPSHOT_RETRY_MINUTES)
+        log(f"Some snapshots failed — scheduled retry in {SNAPSHOT_RETRY_MINUTES} min", is_warning=True)
+
+def fetch_gtfs_static(skip_if_cached=False):
+    # Downloads GTFS zip, deduplicates rows, and updates first/last seen dates.
+    # skip_if_cached=True (startup): skips if parquet files already exist for this agency —
+    # they'll be refreshed at the next scheduled 3AM/3PM run instead.
     if not GTFS_URL or not ENABLE_GTFS_STATIC:
+        return
+    if skip_if_cached and list(GTFS_DIR.glob(f"{AGENCY_PREFIX}_gtfs_*.parquet")):
         return
     log("Pulling static GTFS assets...")
     try:
@@ -607,21 +813,33 @@ def fetch_gtfs_static():
         log(f"GTFS pull failed: {e}", is_error=True)
 
 def scheduler_thread():
-    """Triggers hourly and daily automated tasks."""
+    # Triggers hourly and daily automated tasks.
+    # Also drains _snapshot_retry_at: if fetch_snapshots had failures it schedules a retry
+    # after SNAPSHOT_RETRY_MINUTES rather than waiting until the next top-of-hour run.
+    global _snapshot_retry_at
     last_snapshot_hour = -1
     last_gtfs_pull = -1
-    
+
     while not stop_event.is_set():
         now = datetime.now(LOCAL_TZ)
-        
+
         if ENABLE_SNAPSHOT_PULLS and now.hour != last_snapshot_hour and now.minute == 0:
             threading.Thread(target=fetch_snapshots, daemon=True).start()
             last_snapshot_hour = now.hour
-            
+
+        # Retry snapshots that failed in a previous run (sooner than next top-of-hour).
+        with _snapshot_retry_lock:
+            due = _snapshot_retry_at is not None and now >= _snapshot_retry_at
+            if due:
+                _snapshot_retry_at = None
+        if due:
+            log("Retrying failed snapshots")
+            threading.Thread(target=fetch_snapshots, daemon=True).start()
+
         if ENABLE_GTFS_STATIC and now.hour in [3, 15] and now.hour != last_gtfs_pull:
             threading.Thread(target=fetch_gtfs_static, daemon=True).start()
             last_gtfs_pull = now.hour
-            
+
         time.sleep(10)
 
 #### MAIN ORCHESTRATOR ####
@@ -639,7 +857,7 @@ if __name__ == "__main__":
         if BASE_URL and ENABLE_SNAPSHOT_PULLS:
             threading.Thread(target=fetch_snapshots, daemon=True).start()
         if GTFS_URL and ENABLE_GTFS_STATIC:
-            threading.Thread(target=fetch_gtfs_static, daemon=True).start()
+            threading.Thread(target=fetch_gtfs_static, kwargs={"skip_if_cached": True}, daemon=True).start()
         
         # Deploy Base Streams
         if BASE_URL and ENABLE_BASE_STREAMS:

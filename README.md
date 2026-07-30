@@ -68,7 +68,13 @@ This project aims to adhere to the [MassDOT Developers License Agreement](https:
     parquet_compaction_worker
     │
     ├──► AGENCY_NAME_<endpoint>_<MMDDYYYY>.parquet
-    └──► AGENCY_NAME_gtfs_<table>.parquet
+    ├──► AGENCY_NAME_gtfs_<table>.parquet
+    │
+    ▼
+    cleanup_old_event_parquets
+    │
+    └──► deletes AGENCY_NAME_<endpoint>_<MMDDYYYY>.parquet older than
+         EVENT_RETENTION_DAYS (static gtfs_<table>.parquet files exempt)
 ```
 
 ### Core Components
@@ -77,6 +83,7 @@ This project aims to adhere to the [MassDOT Developers License Agreement](https:
 - **Enhanced Pollers** → bulk snapshot ingestion
 - **Writer Worker** → append-only write-ahead log (JSONL)
 - **Compaction Worker** → JSONL → Parquet + deduplication
+- **Retention Sweep** → deletes event-stream Parquet archives older than `EVENT_RETENTION_DAYS`, leaving static GTFS tables untouched
 - **Scheduler** → snapshot + GTFS orchestration
 - **Queue System** → backpressure-safe buffering
 
@@ -92,7 +99,9 @@ This project aims to adhere to the [MassDOT Developers License Agreement](https:
 
 All schema definitions are intentionally centralized in [**DATA.md**](https://github.com/mxdrew/gtfs-data-archiver/blob/main/DATA.md) to avoid duplication and drift.
 
-Static GTFS uses stable per-table files named `AGENCY_NAME_gtfs_<table>.parquet`, with `first_logged` and `last_logged` metadata tracking the exact timestamp when each unique row was first and most recently seen.
+Static GTFS uses stable per-table files named `AGENCY_NAME_gtfs_<table>.parquet`, with `first_logged` and `last_logged` metadata tracking the exact timestamp when each unique row was first and most recently seen. These files accumulate indefinitely and are never pruned.
+
+Event-stream archives (`AGENCY_NAME_<endpoint>_<MMDDYYYY>.parquet`) are dated per day and are automatically deleted once they're older than `EVENT_RETENTION_DAYS` (default: 30 days).
 
 See:
 - `data/events/` → [DATA.md](https://github.com/mxdrew/gtfs-data-archiver/blob/main/DATA.md#1-dataevents-active-write-ahead-logs) (Active ingestion schema)
@@ -115,6 +124,7 @@ See:
 - Deduplication via SHA-256 `hash_id`  
 - Automatic recovery of orphaned logs  
 - No ordering guarantees across streams or threads  
+- Event-stream Parquet archives older than `EVENT_RETENTION_DAYS` (default: 30) are automatically deleted; static GTFS tables under `data/archive/gtfs/` are never subject to this cleanup  
 
 ## Failure Handling
 
@@ -122,6 +132,10 @@ See:
 - Partial writes are recovered on startup  
 - Parquet archives are merged and deduplicated on re-runs  
 - Queue buffers absorb temporary upstream outages  
+- Snapshot pulls retry up to 3 times on 5xx errors (30s / 60s backoff) before marking as failed  
+- Failed snapshot endpoints trigger a full re-run after `SNAPSHOT_RETRY_MINUTES` (default: 10) rather than waiting until the next hour  
+- Stale `.tmp` files left over from interrupted compaction runs are swept automatically on startup  
+- After each compaction pass, event-stream Parquet archives older than `EVENT_RETENTION_DAYS` (default: 30) are deleted; static GTFS tables are matched against a stable, non-dated filename and are never eligible for this cleanup  
 
 ## Runtime Model
 
@@ -135,8 +149,9 @@ See:
 
 ### Scheduled Tasks
 
-- Hourly snapshot ingestion
-- GTFS refresh at 03:00 and 15:00 (local timezone)
+- Hourly snapshot ingestion; failed endpoints retry after `SNAPSHOT_RETRY_MINUTES` (default: 10) without waiting for the next hour
+- GTFS refresh at 03:00 and 15:00 (local timezone); startup download is skipped if files already exist
+- Event-stream retention sweep runs once per compaction cycle (roughly every 60 seconds), deleting dated event-stream Parquet archives older than `EVENT_RETENTION_DAYS` (default: 30 days); static GTFS tables are unaffected
 
 ### Runtime Logs
 
@@ -171,8 +186,10 @@ The application reads only the values in the table below. Missing values are han
 | `ALERTS_ENHANCED_URL` | Enhanced alerts feed URL - Potentially MBTA Specific | `https://cdn.mbta.com/realtime/Alerts_enhanced.json` |
 | `TRIPS_ENHANCED_URL` | Enhanced trip updates feed URL - Potentially MBTA Specific| `https://cdn.mbta.com/realtime/TripUpdates_enhanced.json` |
 | `DEFAULT_BATCH_SIZE` | Batch size for route grouping | `25` |
+| `SNAPSHOT_RETRY_MINUTES` | Minutes to wait before retrying a failed snapshot run | `10` |
 | `LOG_LEVEL` | Logging verbosity | `warning` |
 | `ARCHIVE_ZSTD_LEVEL` | Parquet compression level used for archive files | `10` |
+| `EVENT_RETENTION_DAYS` | Days to retain compacted event-stream Parquet archives before automatic deletion. Static GTFS tables are never affected. `0` or a negative value disables cleanup. | `30` |
 
 ### Required For Any Run
 
@@ -215,6 +232,7 @@ The application reads only the values in the table below. Missing values are han
 | `ENABLE_GTFS_STATIC` | Enables twice-daily static GTFS downloads |
 | `DEFAULT_BATCH_SIZE` | Batch size for route grouping |
 | `ENHANCED_POLL_INTERVAL_SECONDS` | Poll interval for enhanced bulk feeds |
+| `EVENT_RETENTION_DAYS` | Days to retain event-stream Parquet archives before automatic deletion (static GTFS tables are exempt) |
 
 Static-only runs can disable every API-backed mode and leave only GTFS enabled:
 
@@ -298,7 +316,7 @@ docker compose -f docker-compose.yaml up -d --build
 
 ## Extra Scripts
 
-The `otherScripts/` folder contains dedicated ingestion runners for agency-specific platforms and one multi-agency orchestrator. The only one I reccommend using is `ma_gtfs_archiver.py`, which is a multi-agency runner for static GTFS pulls (MBTA, 14 Massachusetts Regional Transit Agencies, Yankee Line, Massport, some of the ferry operators, and a few local bus routes) with optional MBTA live ingestion. The others are included for informational purposes only.
+The `otherScripts/` folder contains dedicated ingestion runners for agency-specific platforms and one multi-agency orchestrator. The only one I reccommend using is `ma_gtfs_archiver.py`, which is a multi-agency runner for static GTFS pulls across 32+ agencies — including the MBTA, all 15 Massachusetts Regional Transit Authorities, private bus carriers (Coach Company, DATTCO, Peter Pan, Plymouth & Brockton, Yankee Line), ferry services (Bay State Cruise, Block Island Ferry, Cuttyhunk, Freedom Cruise Line, Hy-Line Cruises, Patriot Party Boats, Seastreak, Vineyard Fast Ferry, Steamship Authority), Massport/Logan Express, Lexpress, and Amtrak — with optional MBTA live ingestion. The others, if any others exist at the time you are reading this, are included for informational purposes only.
 
 _**DISCLAIMER**: <u>These should be used at your own discretion and risk</u>. They are not maintained. They are also not tested to the same degree as the main `gtfs_archiver.py` script, so they may contain bugs or issues that could cause data loss or other problems. Especially as not all of the APIs or endpoints queried are necessarily supported by their providers (i.e., they are meant to feed the agency's own realtime maps, not necessairly to be queried by the public, and by doing so you may be causing disruption or getting your IP blocked). If you choose to use anything else in `otherScripts/`, please review the code carefully, consider if you _<u>realllllyyyyy</u>_ want to run them, and also consider running them in a test environment first. These are really only included for informational purposes._
 
@@ -307,7 +325,7 @@ Everything in `otherScripts` reads environment-based configuration and writes ou
 Said `.env` includes:
 
 - `otherScripts/ma_gtfs_archiver.py`:
-`MBTA_API_KEY`, `GTFS_DOWNLOAD_USER_AGENT`, plus shared runtime variables `SYNC_TIMEZONE`, `ARCHIVE_ZSTD_LEVEL`, `LOG_LEVEL`
+`MBTA_API_KEY`, `GTFS_DOWNLOAD_USER_AGENT`, plus shared runtime variables `SYNC_TIMEZONE`, `ARCHIVE_ZSTD_LEVEL`, `LOG_LEVEL`, `EVENT_RETENTION_DAYS`
 
 - `otherScripts/bustime.py`:
 `BUSTIME_AGENCY`, `BUSTIME_BASE_URL`, `BUSTIME_API_KEY`, `GTFS_FEED_URL`, `VERBOSE_LOGGING`, plus shared runtime variables `SYNC_TIMEZONE`, `ARCHIVE_ZSTD_LEVEL`, `DATA_DIR`, `DATA_DIR_WSL`
