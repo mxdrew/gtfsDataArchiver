@@ -29,8 +29,13 @@ services:
 
       # Tuning and logging
       - DEFAULT_BATCH_SIZE=25
+      - PREDICTIONS_BATCH_SIZE=75
+      - SNAPSHOT_RETRY_MINUTES=10
       - LOG_LEVEL=warning
       - ARCHIVE_ZSTD_LEVEL=10
       - EVENT_RETENTION_DAYS=30
+
+      # Identifies your archiver to GTFS hosts (optional here; required by ma_gtfs_archiver.py)
+      - GTFS_DOWNLOAD_USER_AGENT=gtfs-data-archiver/1.0 (+https://github.com/YOUR_USERNAME/your-fork)
     volumes:
       - ./data:/app/data

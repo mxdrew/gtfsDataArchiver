@@ -35,13 +35,14 @@ This project aims to adhere to the [MassDOT Developers License Agreement](https:
   - [Required Only For API-Backed Modes](#required-only-for-api-backed-modes)
   - [Mode-Specific Variables](#mode-specific-variables)
   - [Multiple Agencies](#multiple-agencies)
+    - [Example Compose Files](#example-compose-files)
 - [Extra Scripts](#extra-scripts)
+  - [`ma_gtfs_archiver.py`](#ma_gtfs_archiverpy)
+  - [`clean_and_merge.py`](#clean_and_mergepy)
 - [Installation](#installation)
   - [Docker (Recommended)](#docker-recommended)
   - [Manual](#manual)
 - [Operational Notes](#operational-notes)
-- [Security Notes](#security-notes)
-- [Design Rationale](#design-rationale)
 - [Data Archive](#data-archive)
 - [Future Plans](#future-plans)
 - [Other Cool Links](#other-cool-links)
@@ -166,6 +167,8 @@ Configuration is defined directly in the compose file. `docker-compose.yaml` is 
 
 The application reads only the values in the table below. Missing values are handled safely, and stream-only, snapshot-only, or GTFS-only runs are all supported by the toggles.
 
+Further info on which variables are used in files from `otherScripts/` is in the [Extra Scripts](#extra-scripts) section.
+
 | Variable | Purpose | Default in `docker-compose.yaml` |
 |-||-|
 | `API_KEY` | API authentication key | YOUR_API_KEY |
@@ -186,24 +189,26 @@ The application reads only the values in the table below. Missing values are han
 | `ALERTS_ENHANCED_URL` | Enhanced alerts feed URL - Potentially MBTA Specific | `https://cdn.mbta.com/realtime/Alerts_enhanced.json` |
 | `TRIPS_ENHANCED_URL` | Enhanced trip updates feed URL - Potentially MBTA Specific| `https://cdn.mbta.com/realtime/TripUpdates_enhanced.json` |
 | `DEFAULT_BATCH_SIZE` | Batch size for route grouping | `25` |
+| `PREDICTIONS_BATCH_SIZE` | Batch size for the predictions route stream (falls back to `max(DEFAULT_BATCH_SIZE, 75)` if unset) | `75` |
 | `SNAPSHOT_RETRY_MINUTES` | Minutes to wait before retrying a failed snapshot run | `10` |
 | `LOG_LEVEL` | Logging verbosity | `warning` |
 | `ARCHIVE_ZSTD_LEVEL` | Parquet compression level used for archive files | `10` |
 | `EVENT_RETENTION_DAYS` | Days to retain compacted event-stream Parquet archives before automatic deletion. Static GTFS tables are never affected. `0` or a negative value disables cleanup. | `30` |
+| `GTFS_DOWNLOAD_USER_AGENT` | User-Agent header sent on static GTFS ZIP downloads. Optional here, but required by `ma_gtfs_archiver.py` (see [Extra Scripts](#extra-scripts)). | `gtfs-data-archiver/1.0 (+repo URL)` |
 
 ### Required For Any Run
 
 | Variable | Description |
 |-|-|
-| `SYNC_TIMEZONE` | [IANA timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones#List) string used for scheduling and timestamp alignment |
-| `ARCHIVE_ZSTD_LEVEL` | Compression level for Parquet archives |
-| `LOG_LEVEL` | Logging verbosity (e.g., `info`, `warnings`, `errors`) |
+| `SYNC_TIMEZONE` | [IANA timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones#List) string used for scheduling and timestamp alignment. The archiver will not start without a valid value. |
 
 ### Recommended For Any Run
 
 | Variable | Description |
 |-|-|
 | `AGENCY_NAME` | Prefix used in generated file names; defaults to `agency` if omitted |
+| `ARCHIVE_ZSTD_LEVEL` | Compression level for Parquet archives (default: `10`) |
+| `LOG_LEVEL` | Logging verbosity (`info`, `warning`, `errors`; default: `info`) |
 
 ### Required For Static GTFS Mode
 
@@ -231,8 +236,11 @@ The application reads only the values in the table below. Missing values are han
 | `ENABLE_ENHANCED_STREAMS` | Enables enhanced bulk pollers |
 | `ENABLE_GTFS_STATIC` | Enables twice-daily static GTFS downloads |
 | `DEFAULT_BATCH_SIZE` | Batch size for route grouping |
+| `PREDICTIONS_BATCH_SIZE` | Batch size for the predictions route stream |
+| `SNAPSHOT_RETRY_MINUTES` | Minutes before retrying a failed snapshot run |
 | `ENHANCED_POLL_INTERVAL_SECONDS` | Poll interval for enhanced bulk feeds |
 | `EVENT_RETENTION_DAYS` | Days to retain event-stream Parquet archives before automatic deletion (static GTFS tables are exempt) |
+| `GTFS_DOWNLOAD_USER_AGENT` | User-Agent header for static GTFS ZIP downloads |
 
 Static-only runs can disable every API-backed mode and leave only GTFS enabled:
 
@@ -316,37 +324,47 @@ docker compose -f docker-compose.yaml up -d --build
 
 ## Extra Scripts
 
-The `otherScripts/` folder contains dedicated ingestion runners for agency-specific platforms and one multi-agency orchestrator. The only one I reccommend using is `ma_gtfs_archiver.py`, which is a multi-agency runner for static GTFS pulls across 32+ agencies — including the MBTA, all 15 Massachusetts Regional Transit Authorities, private bus carriers (Coach Company, DATTCO, Peter Pan, Plymouth & Brockton, Yankee Line), ferry services (Bay State Cruise, Block Island Ferry, Cuttyhunk, Freedom Cruise Line, Hy-Line Cruises, Patriot Party Boats, Seastreak, Vineyard Fast Ferry, Steamship Authority), Massport/Logan Express, Lexpress, and Amtrak — with optional MBTA live ingestion. The others, if any others exist at the time you are reading this, are included for informational purposes only.
+The `otherScripts/` folder contains two companion scripts to the main archiver: 
+- [`ma_gtfs_archiver.py`](#ma_gtfs_archiverpy), a multi-agency ingestion runner.
+- [`clean_and_merge.py`](#clean_and_mergepy), a post-processing pipeline.
 
-_**DISCLAIMER**: <u>These should be used at your own discretion and risk</u>. They are not maintained. They are also not tested to the same degree as the main `gtfs_archiver.py` script, so they may contain bugs or issues that could cause data loss or other problems. Especially as not all of the APIs or endpoints queried are necessarily supported by their providers (i.e., they are meant to feed the agency's own realtime maps, not necessairly to be queried by the public, and by doing so you may be causing disruption or getting your IP blocked). If you choose to use anything else in `otherScripts/`, please review the code carefully, consider if you _<u>realllllyyyyy</u>_ want to run them, and also consider running them in a test environment first. These are really only included for informational purposes._
+Both scripts resolve their `.env` the same way: a `.env` sitting alongside the script (`otherScripts/.env`) is used if present; otherwise the search walks up parent directories and falls back to the repo-root `.env`. In practice this means a single root `.env` configures everything, and an `otherScripts/.env` can optionally override it for just the helper scripts.
 
-### Root `.env` Variables `otherScripts`
-Everything in `otherScripts` reads environment-based configuration and writes outputs under the configured data directory.
-Said `.env` includes:
+### `ma_gtfs_archiver.py`
 
-- `otherScripts/ma_gtfs_archiver.py`:
-`MBTA_API_KEY`, `GTFS_DOWNLOAD_USER_AGENT`, plus shared runtime variables `SYNC_TIMEZONE`, `ARCHIVE_ZSTD_LEVEL`, `LOG_LEVEL`, `EVENT_RETENTION_DAYS`
+A multi-agency ingestion runner, [`ma_gtfs_archiver.py`](https://github.com/mxdrew/gtfs-data-archiver/blob/main/otherScripts/ma_gtfs_archiver.py) handles static GTFS pulls across 32+ agencies — including the MBTA, all 15 Massachusetts Regional Transit Authorities, private bus carriers (Coach Company, DATTCO, Peter Pan, Plymouth & Brockton, Yankee Line), ferry services (Bay State Cruise, Block Island Ferry, Cuttyhunk, Freedom Cruise Line, Hy-Line Cruises, Patriot Party Boats, Seastreak, Vineyard Fast Ferry, Steamship Authority), Massport/Logan Express, Lexpress, and Amtrak — with optional MBTA live ingestion.
 
-- `otherScripts/bustime.py`:
-`BUSTIME_AGENCY`, `BUSTIME_BASE_URL`, `BUSTIME_API_KEY`, `GTFS_FEED_URL`, `VERBOSE_LOGGING`, plus shared runtime variables `SYNC_TIMEZONE`, `ARCHIVE_ZSTD_LEVEL`, `DATA_DIR`, `DATA_DIR_WSL`
+Environment variables read (from `otherScripts/.env`):
 
-- `otherScripts/routematch.py`:
-`ROUTEMATCH_AGENCY`, `ROUTEMATCH_BASE_URL`, `ROUTEMATCH_REFERER`, plus shared runtime variables `SYNC_TIMEZONE`, `ARCHIVE_ZSTD_LEVEL`, `DATA_DIR`, `DATA_DIR_WSL`
+| Variable | Description |
+|-|-|
+| `GTFS_DOWNLOAD_USER_AGENT` | **Required.** User-Agent header sent on every GTFS download; the script refuses to start without one. |
+| `SYNC_TIMEZONE` | Required. IANA timezone for scheduling and filenames. |
+| `MBTA_API_KEY` | Optional. Enables the MBTA live ingestion portion. |
+| `LOG_LEVEL` | Optional. Logging verbosity (default: `info`). |
+| `ARCHIVE_ZSTD_LEVEL` | Optional. Parquet compression level (default: `10`). |
+| `EVENT_RETENTION_DAYS` | Optional. Event-stream Parquet retention in days (default: `30`; static GTFS tables exempt). |
+| `DEFAULT_BATCH_SIZE` / `PREDICTIONS_BATCH_SIZE` | Optional. Route batching sizes (defaults: `25` / `max(DEFAULT_BATCH_SIZE, 75)`). |
+| `SNAPSHOT_RETRY_MINUTES` | Optional. Minutes before retrying a failed snapshot run (default: `10`). |
 
-- `otherScripts/passigo.py`:
-`PASSIOGO_AGENCY_CATALOG`, `PASSIOGO_TARGET_AGENCY_IDS`, `PASSIOGO_SAVE_ACTIVE_JSON`, plus shared runtime variables `SYNC_TIMEZONE`, `ARCHIVE_ZSTD_LEVEL`, `DATA_DIR`, `DATA_DIR_WSL`
+Output is written to `./data` relative to the working directory the script is launched from.
 
-- `otherScripts/massport.py`:
-uses fixed in-script agency and polling values; only shared runtime variables apply (`SYNC_TIMEZONE`, `ARCHIVE_ZSTD_LEVEL`, `DATA_DIR`, `DATA_DIR_WSL`).
+_**DISCLAIMER**: <u>Live real-time ingestion is only recommended for the MBTA.</u> Static GTFS downloads are published for public consumption, but most agencies' real-time endpoints are not — they exist to feed the agency's own live maps and rider apps, are undocumented and unsupported for third-party use, and may change or vanish without notice. Continuously polling them can put real load on systems that actual riders depend on, and may get your IP blocked. The MBTA is the exception: its [V3 API](https://www.mbta.com/developers/v3-api) and enhanced feeds are publicly documented and intended for developer use. If you choose to ingest live data from any other agency anyway, you do so at your own discretion and risk — review the relevant code carefully, consider whether you _<u>realllllyyyyy</u>_ want to run it, and test in an isolated environment first._
 
-- `otherScripts/gtfsrt.py`:
-`GTFSRT_TARGET_AGENCIES` (optional; comma-separated list of agencies to enable, defaults to all), plus shared runtime variables `SYNC_TIMEZONE`, `ARCHIVE_ZSTD_LEVEL`, `POLL_INTERVAL_FAST`, `POLL_INTERVAL_MEDIUM`, `POLL_INTERVAL_SLOW`, `DATA_DIR`, `DATA_DIR_WSL`. Requires `gtfs-realtime-bindings` (`pip install gtfs-realtime-bindings`).
+### `clean_and_merge.py`
 
-- `otherScripts/swiv.py`:
-`SWIV_TARGET_AGENCIES` (optional; comma-separated list of agencies to enable, defaults to all), plus shared runtime variables `SYNC_TIMEZONE`, `ARCHIVE_ZSTD_LEVEL`, `POLL_INTERVAL_CRAWLER`, `DATA_DIR`, `DATA_DIR_WSL`.
+A post-processing pipeline that consolidates raw archiver output into clean, unified historical datasets. [`clean_and_merge.py`](https://github.com/mxdrew/gtfs-data-archiver/blob/main/otherScripts/clean_and_merge.py) standardizes shard filenames in place, converts any remaining JSONL write-ahead logs into ZSTD-compressed Parquet, then classifies and merges daily shards — static GTFS tables are deduplicated by SHA-256 `hash_id` while preserving `first_logged`/`last_logged` observation windows, and event streams are compacted into per-type archives. Corrupt or partially-written Parquet files are automatically repaired where possible (tolerant row-group reads, footer reconstruction for truncated files); unrecoverable files are quarantined rather than silently dropped. A strict overwrite guard ensures existing archives are never clobbered — merges write to temp files and atomically replace their targets.
 
-- `otherScripts/transloc.py`:
-`TRANSLOC_AGENCY` (optional; defaults to NRTA), `TRANSLOC_BASE_URL` (optional; defaults to nrtawave.transloc.com relay), `TRANSLOC_API_KEY` (optional; defaults to public map key), plus shared runtime variables `SYNC_TIMEZONE`, `ARCHIVE_ZSTD_LEVEL`, `POLL_INTERVAL_FAST`, `POLL_INTERVAL_MEDIUM`, `POLL_INTERVAL_SLOW`, `DATA_DIR`, `DATA_DIR_WSL`.
+Environment variables read (from the repo-root `.env`):
+
+| Variable | Description |
+|-|-|
+| `DATA_DIR_WSL` | Final archive directory. Accepts Windows (`D:\gtfs-data`) or WSL (`/mnt/d/gtfs-data`) style paths; translated automatically for the current platform. Falls back to the current directory if unset. |
+| `STAGING_DIR_WSL` | Staging directory holding incoming shards; same path translation as above. Falls back to `DATA_DIR_WSL` if unset. |
+| `SYNC_TIMEZONE` | Optional. IANA timezone for log timestamps (default: UTC). |
+| `ARCHIVE_ZSTD_LEVEL` | Optional. Parquet compression level (default: `12`). |
+| `JSONL_CHUNK_SIZE` | Optional. Rows per chunk during JSONL → Parquet conversion (default: `50000`). |
+| `LOG_LEVEL` | Optional. Logging verbosity (default: `info`). |
 
 ## Installation
 
@@ -369,7 +387,7 @@ pip install -r requirements.txt
 python gtfs_archiver.py
 ```
 
-For manual runs, use the included `.env` sample as the starting point: [`.env`](https://github.com/mxdrew/gtfs-data-archiver/blob/main/.env). Update the values that make the agency unique, especially `AGENCY_NAME`, `SYNC_TIMEZONE`, `API_KEY`, `BASE_URL`, `GTFS_URL`, `BASE_STREAMS`, `ROUTE_STREAMS`, `SNAPSHOT_EPS`, the `VEHICLES_ENHANCED_URL`/`ALERTS_ENHANCED_URL`/`TRIPS_ENHANCED_URL` entries, and the `ENABLE_*` flags. I did not try multiple agencies with this, but I'd imagine in order to do so you'd need to clone `gtfs_archiver.py` and `.env`, rename them, update the new `.env` file, and then launch the cloned script.
+For manual runs, use the included `.env` sample as the starting point: [`.env`](https://github.com/mxdrew/gtfs-data-archiver/blob/main/.env). Update the values that make the agency unique, especially `AGENCY_NAME`, `SYNC_TIMEZONE`, `API_KEY`, `BASE_URL`, `GTFS_URL`, `BASE_STREAMS`, `ROUTE_STREAMS`, `SNAPSHOT_EPS`, the `VEHICLES_ENHANCED_URL`/`ALERTS_ENHANCED_URL`/`TRIPS_ENHANCED_URL` entries, `GTFS_DOWNLOAD_USER_AGENT`, and the `ENABLE_*` flags. I did not try multiple agencies with this, but I'd imagine in order to do so you'd need to clone `gtfs_archiver.py` and `.env`, rename them, update the new `.env` file, and then launch the cloned script.
 
 ## Operational Notes
 

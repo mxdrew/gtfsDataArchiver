@@ -17,3 +17,7 @@ docker-compose-*.yaml
 
 otherScripts/*
 !otherScripts/ma_gtfs_archiver.py
+
+!otherScripts/utilityScripts/
+otherScripts/utilityScripts/*
+!otherScripts/utilityScripts/clean_and_merge.py

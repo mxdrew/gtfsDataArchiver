@@ -2,7 +2,7 @@
 # Author Information:
 # Drew Mulcare
 # github@mxdrew.com
-# May 25, 2026 (Last updated July 29, 2026)
+# May 25, 2026 (Last updated August 06, 2026)
 #
 # Description:
 # Multi-agency runner for static GTFS and optional MBTA live ingestion.
@@ -62,8 +62,13 @@ import pyarrow.parquet as pq
 from dotenv import load_dotenv
 from urllib3.util.retry import Retry
 
-# Load environment variables
-load_dotenv(Path(__file__).with_name(".env"))
+# Load environment variables: prefer a .env alongside this script, otherwise walk
+# up parent directories (otherScripts/, then the repo root) and use the first found.
+for _env_dir in Path(__file__).resolve().parents:
+    _env_candidate = _env_dir / ".env"
+    if _env_candidate.exists():
+        load_dotenv(_env_candidate)
+        break
 
 # Setup logging
 logging.basicConfig(level=logging.WARNING)
