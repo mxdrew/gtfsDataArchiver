@@ -42,12 +42,12 @@ _**Note:** [GATRA](https://www.gatra.org/) static GTFS is included and currently
 
 _**Additional Note:** 100% uptime is **NOT** guaranteed. Sometimes things crash or break or power goes out, but eventually I'll try to add a table indicating dates missed for the static ones - TBD though as the data isn't entirely set up in the best way for that right now._
 
-_**Yet Another Note:** A visual calendar of each transit agency's live-stream data, and when the calendar was last updated, is accessible as [`agency_realtime_coverage.html`](https://github.com/mxdrew/gtfs-data-archiver/blob/main/agency_realtime_coverage.html) or as a standalone page on [my website](https://mxdrew.com/agency_realtime_coverage_)._
+_**Yet Another Note:** A visual calendar of each transit agency's live-stream data, and when the calendar was last updated, is accessible as [`agencyRealtimeCoverage.html`](https://github.com/mxdrew/gtfsDataArchiver/blob/main/agencyRealtimeCoverage.html) or as a standalone page on [my website](https://mxdrew.com/agencyRealtimeCoverage_)._
 
 
 ## Static GTFS Script
  
-Static GTFS pulls for the MBTA, all 15 Massachusetts regional transit authorities, ferry services (Bay State Cruise, Block Island Ferry, Cuttyhunk, Freedom Cruise Line, Hy-Line Cruises, Patriot Party Boats, Seastreak, Vineyard Fast Ferry), private bus carriers (Coach Company, DATTCO, Peter Pan, Plymouth & Brockton, Yankee Line), Massport/Logan Express, Lexpress, the Steamship Authority, and Amtrak are handled by [otherScripts/ma_gtfs_archiver.py](https://github.com/mxdrew/gtfs-data-archiver/blob/main/otherScripts/ma_gtfs_archiver.py), with optionally enabled MBTA live stream ingestion. Do some of these technically operate outside of MA? Yes, but they do operate _in_ MA so they count. Also... it's Amtrak! ~Ignoring that several of the private agecnies go outside MA too - they're less exciting.~
+Static GTFS pulls for the MBTA, all 15 Massachusetts regional transit authorities, ferry services (Bay State Cruise, Block Island Ferry, Cuttyhunk, Freedom Cruise Line, Hy-Line Cruises, Patriot Party Boats, Seastreak, Vineyard Fast Ferry), private bus carriers (Coach Company, DATTCO, Peter Pan, Plymouth & Brockton, Yankee Line), Massport/Logan Express, Lexpress, the Steamship Authority, and Amtrak are handled by [otherScripts/maGTFSArchiver.py](https://github.com/mxdrew/gtfsDataArchiver/blob/main/otherScripts/maGTFSArchiver.py), with optionally enabled MBTA live stream ingestion. Do some of these technically operate outside of MA? Yes, but they do operate _in_ MA so they count. Also... it's Amtrak! ~Ignoring that several of the private agecnies go outside MA too - they're less exciting.~
 
 
 ---

@@ -2,7 +2,7 @@
 # Author Information:
 # Drew Mulcare
 # github@mxdrew.com
-# June 23, 2026 (Last updated August 06, 2026)
+# June 23, 2026 (Last updated August 07, 2026)
 #
 # Description:
 # Combined transit data lake maintenance utility.
@@ -17,7 +17,7 @@
 #
 # License:
 # BSD 3-Clause License
-# Find the full agreement at https://github.com/mxdrew/gtfs-data-logger/blob/main/LICENSE
+# Find the full agreement at https://github.com/mxdrew/gtfsDataArchiver/blob/main/LICENSE
 
 import os
 import re
@@ -33,6 +33,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -131,6 +132,62 @@ STREAM_MAPPING = {
 }
 
 DEFERRED_RENAMES = []
+
+# Known 511 SF Bay operator ids (from the gtfsoperators roster). Any of these
+# appearing as an agency token (or as a "511_<id>" doubled prefix from older runs)
+# is normalized to the bare uppercase id. Capitol Corridor is operator "AM"
+# (Amtrak-operated), so it folds into AMTRAK instead; the per-record "source"
+# field (511 vs amtrak) preserves provenance. NOTE: "CC" is County Connection,
+# NOT Capitol Corridor.
+FIVEONEONE_OPERATOR_IDS = {
+    "3D", "AC", "AF", "AM", "BA", "CC", "CE", "CM", "CR", "CT", "DE", "EE", "EM",
+    "FS", "GF", "GG", "GP", "MA", "MB", "MC", "MV", "PE", "PG", "RG", "RV", "SA",
+    "SB", "SC", "SF", "SI", "SL", "SM", "SO", "SR", "SS", "ST", "TF", "UC", "VC",
+    "VN", "WC", "WH",
+}
+
+# Explicit agency-token remaps applied in STEP 0. Capitol Corridor (511 operator
+# "AM") is stored under the AMTRAK archive regardless of source.
+AGENCY_MAPPING = {
+    "AM": "AMTRAK",           # 511 operator AM = Capitol Corridor (Amtrak-operated)
+    "CAPITOLCORRIDOR": "AMTRAK",
+    "CAPITAL_CORRIDOR": "AMTRAK",
+}
+
+
+def resolve_agency_token(agency, stream_raw):
+    """STEP 0 helper. Given the greedy-parsed (agency, stream_raw) from a filename,
+    return a corrected (agency, stream_raw) pair that:
+      * unwraps a legacy "511_<id>_<stream>" doubled prefix into "<ID>_<stream>",
+      * maps Capitol Corridor (511 operator AM) to AMTRAK,
+      * uppercases bare 511 operator ids,
+    while leaving all existing single-token agencies (MBTA, SRTA, ...) untouched.
+    """
+    # Case 0: legacy multi-word "Capitol_Corridor_<stream>" (an earlier naming
+    # experiment) parses greedily as agency="Capitol", stream="Corridor_<stream>".
+    # Fold it into AMTRAK and drop the trailing "Corridor_" from the stream.
+    if agency.upper() == "CAPITOL" and stream_raw.upper().startswith("CORRIDOR_"):
+        agency = "AMTRAK"
+        stream_raw = stream_raw.split("_", 1)[1]
+
+    # Case 1: legacy doubled prefix "511_<id>_<rest>" -> agency parsed as "511",
+    # stream_raw begins with the operator id (e.g. "CC_vehiclepositions").
+    if agency == "511" and "_" in stream_raw:
+        maybe_id, rest = stream_raw.split("_", 1)
+        if maybe_id.upper() in FIVEONEONE_OPERATOR_IDS:
+            agency = maybe_id.upper()
+            stream_raw = rest
+
+    # Case 2: bare 511 operator id as the agency token (already unwrapped, or from
+    # the current 511org.py naming). Uppercase it for consistency.
+    if agency.upper() in FIVEONEONE_OPERATOR_IDS:
+        agency = agency.upper()
+
+    # Case 3: explicit remaps (AM -> AMTRAK, etc.).
+    agency = AGENCY_MAPPING.get(agency.upper(), agency)
+
+    return agency, stream_raw
+
 
 def _resolve_local_tz():
     """Resolve timezone from env with safe fallbacks for Windows/WSL installs."""
@@ -454,6 +511,10 @@ def standardize_filenames_in_scan_roots(scan_roots, is_deferred_pass=False):
                 date_str = match.group(3)
                 ext = match.group(4)
 
+                # Normalize the agency token: unwrap legacy "511_<id>" prefixes,
+                # fold Capitol Corridor into AMTRAK, uppercase 511 operator ids.
+                agency, stream_raw = resolve_agency_token(agency, stream_raw)
+
                 stream_lower = stream_raw.lower()
                 standard_stream = STREAM_MAPPING.get(stream_lower, stream_lower)
 
@@ -501,6 +562,189 @@ def standardize_filenames_in_scan_roots(scan_roots, is_deferred_pass=False):
         log(f"  Standardization pass complete: renamed={rename_count}, deferred={len(DEFERRED_RENAMES)}")
 
 
+#### ROW HASH INDEXING ####
+
+# Dedup keys are the leading 128 bits of each row's SHA-256 hash_id, stored as two
+# uint64 fields. A Python set of the 64-char hex strings costs ~170 bytes per row,
+# so a 6M-row archive burns roughly a gigabyte before a single row is merged and
+# the process gets OOM-killed mid-rewrite. 16 bytes per row keeps collisions
+# impossible in practice (birthday odds ~1e-20 at these volumes) at a tenth the cost.
+HASH_KEY_DTYPE = np.dtype([("hi", "<u8"), ("lo", "<u8")])
+_UINT64_MASK = 0xFFFFFFFFFFFFFFFF
+
+# Nibble values for ASCII hex digits; every other byte stays 0 and is rejected by
+# the validity mask before it can silently produce a wrong key.
+_HEX_NIBBLE_LUT = np.zeros(256, dtype=np.uint8)
+_HEX_NIBBLE_LUT[ord("0"):ord("9") + 1] = np.arange(10, dtype=np.uint8)
+_HEX_NIBBLE_LUT[ord("a"):ord("f") + 1] = np.arange(10, 16, dtype=np.uint8)
+_HEX_NIBBLE_LUT[ord("A"):ord("F") + 1] = np.arange(10, 16, dtype=np.uint8)
+_HEX_IS_DIGIT = np.zeros(256, dtype=bool)
+_HEX_IS_DIGIT[ord("0"):ord("9") + 1] = True
+_HEX_IS_DIGIT[ord("a"):ord("f") + 1] = True
+_HEX_IS_DIGIT[ord("A"):ord("F") + 1] = True
+
+
+def _hex_matrix_from_arrow(array):
+    """Expose a fixed-width string column as an (n, 32) uint8 matrix of hex characters.
+
+    Reads straight out of Arrow's value buffer so a multi-million-row hash column
+    never becomes multi-million Python string objects. Returns None whenever the
+    layout is not uniform 64-byte values, which sends the caller to the slow path.
+    """
+    if len(array) == 0 or array.null_count:
+        return None
+    if pa.types.is_large_string(array.type) or pa.types.is_large_binary(array.type):
+        offset_dtype = np.int64
+    elif pa.types.is_string(array.type) or pa.types.is_binary(array.type):
+        offset_dtype = np.int32
+    else:
+        return None
+
+    buffers = array.buffers()
+    if len(buffers) < 3 or buffers[1] is None or buffers[2] is None:
+        return None
+
+    itemsize = np.dtype(offset_dtype).itemsize
+    offsets = np.frombuffer(
+        buffers[1],
+        dtype=offset_dtype,
+        count=len(array) + 1,
+        offset=array.offset * itemsize,
+    )
+    if not np.all(offsets[1:] - offsets[:-1] == 64):
+        return None
+
+    values = np.frombuffer(buffers[2], dtype=np.uint8, count=64 * len(array), offset=int(offsets[0]))
+    return values.reshape(-1, 64)[:, :32]
+
+
+def _keys_from_hex_matrix(matrix):
+    """Fold 32 hex characters per row into two uint64 halves. None if any byte isn't hex."""
+    if not _HEX_IS_DIGIT[matrix].all():
+        return None
+
+    nibbles = _HEX_NIBBLE_LUT[matrix]
+    keys = np.empty(matrix.shape[0], dtype=HASH_KEY_DTYPE)
+    high = np.zeros(matrix.shape[0], dtype=np.uint64)
+    low = np.zeros(matrix.shape[0], dtype=np.uint64)
+    shift = np.uint64(4)
+    # Shift-accumulate rather than multiplying a widened (n, 32) uint64 matrix,
+    # which would allocate 256 bytes of scratch per row on every block.
+    for column in range(16):
+        high <<= shift
+        high |= nibbles[:, column]
+        low <<= shift
+        low |= nibbles[:, 16 + column]
+    keys["hi"] = high
+    keys["lo"] = low
+    return keys
+
+
+def _keys_from_python(values):
+    """Per-row fallback for null, short, or non-hex hash_id values."""
+    keys = np.empty(len(values), dtype=HASH_KEY_DTYPE)
+    for position, value in enumerate(values):
+        text = "" if value is None else str(value)
+        number = None
+        if len(text) == 64:
+            try:
+                number = int(text, 16) >> 128
+            except ValueError:
+                number = None
+        if number is None:
+            number = int.from_bytes(hashlib.blake2b(text.encode("utf-8"), digest_size=16).digest(), "big")
+        keys["hi"][position] = number >> 64
+        keys["lo"][position] = number & _UINT64_MASK
+    return keys
+
+
+def hash_keys_from_column(column):
+    """Convert a hash_id column (Array or ChunkedArray) into compact dedup keys."""
+    chunks = column.chunks if isinstance(column, pa.ChunkedArray) else [column]
+    parts = []
+    for chunk in chunks:
+        if len(chunk) == 0:
+            continue
+        matrix = _hex_matrix_from_arrow(chunk)
+        keys = _keys_from_hex_matrix(matrix) if matrix is not None else None
+        if keys is None:
+            keys = _keys_from_python(chunk.to_pylist())
+        parts.append(keys)
+
+    if not parts:
+        return np.empty(0, dtype=HASH_KEY_DTYPE)
+    return parts[0] if len(parts) == 1 else np.concatenate(parts)
+
+
+class HashKeyIndex:
+    """Membership set over 128-bit row hashes, backed by sorted numpy blocks.
+
+    Additions land in a pending block that is folded into the main block only once
+    it passes the compaction threshold, so appending millions of rows never costs a
+    full re-sort per row group.
+    """
+
+    __slots__ = ("_main", "_pending", "_compact_threshold")
+
+    def __init__(self, seed_keys=None, compact_threshold=1_000_000):
+        self._main = seed_keys if seed_keys is not None else np.empty(0, dtype=HASH_KEY_DTYPE)
+        self._pending = np.empty(0, dtype=HASH_KEY_DTYPE)
+        self._compact_threshold = compact_threshold
+
+    @staticmethod
+    def _block_contains(block, keys):
+        if block.size == 0 or keys.size == 0:
+            return np.zeros(keys.size, dtype=bool)
+        positions = np.searchsorted(block, keys)
+        np.minimum(positions, block.size - 1, out=positions)
+        # Compare through a plain uint64 view: elementwise equality on structured
+        # dtypes has shifted behaviour across numpy releases.
+        block_pairs = block.view(np.uint64).reshape(-1, 2)
+        key_pairs = keys.view(np.uint64).reshape(-1, 2)
+        return ((block_pairs[positions, 0] == key_pairs[:, 0])
+                & (block_pairs[positions, 1] == key_pairs[:, 1]))
+
+    def contains(self, keys):
+        found = self._block_contains(self._main, keys)
+        if self._pending.size:
+            found |= self._block_contains(self._pending, keys)
+        return found
+
+    def add(self, keys):
+        if keys.size == 0:
+            return
+        self._pending = np.unique(np.concatenate([self._pending, keys]))
+        if self._pending.size >= self._compact_threshold:
+            self._main = np.unique(np.concatenate([self._main, self._pending]))
+            self._pending = np.empty(0, dtype=HASH_KEY_DTYPE)
+
+    @property
+    def size(self):
+        return self._main.size + self._pending.size
+
+
+def select_unseen_event_rows(table_block, hash_index):
+    """Keep only rows whose hash is neither already archived nor already written this run."""
+    if "hash_id" not in table_block.column_names or table_block.num_rows == 0:
+        return table_block
+
+    keys = hash_keys_from_column(table_block.column("hash_id"))
+    fresh_positions = np.flatnonzero(~hash_index.contains(keys))
+    if fresh_positions.size == 0:
+        return table_block.slice(0, 0)
+
+    unique_keys, first_seen = np.unique(keys[fresh_positions], return_index=True)
+    if unique_keys.size != fresh_positions.size:
+        # np.unique returns positions in sorted-key order; re-sort to preserve the
+        # original row order so the archive stays append-ordered.
+        fresh_positions = fresh_positions[np.sort(first_seen)]
+    hash_index.add(unique_keys)
+
+    if fresh_positions.size == table_block.num_rows:
+        return table_block
+    return table_block.take(pa.array(fresh_positions, type=pa.int64()))
+
+
 #### FILE PROCESSING ####
 
 def row_hash(table_name, row_dict):
@@ -516,19 +760,17 @@ def convert_jsonl_to_parquet(source_path, target_path, chunk_size=None):
     if chunk_size is None:
         chunk_size = JSONL_CHUNK_SIZE
 
-    # OPTIMIZATION: Use the blazingly fast PyArrow engine if Pandas 2.0+ is installed.
-    # This bypasses Pandas' slow Python-level JSON parsing loop entirely.
+    # NOTE: pandas' pyarrow JSON engine does NOT support the chunksize parameter
+    # (it raises "currently pyarrow engine doesn't support chunksize parameter").
+    # Since we stream large JSONL files in chunks to bound memory, we must use the
+    # default ujson/python engine here. The pyarrow engine is only usable for a
+    # single-shot (unchunked) read, which we deliberately avoid for large files.
     read_kwargs = {
         "path_or_buf": source_path,
         "lines": True,
         "chunksize": chunk_size,
         "dtype": str,
     }
-    try:
-        if int(pd.__version__.split(".")[0]) >= 2:
-            read_kwargs["engine"] = "pyarrow"
-    except Exception:
-        pass
 
     parquet_writer = None
     try:
@@ -1364,40 +1606,6 @@ def run_cleanup_and_merge():
 
                     return pa.Table.from_pandas(df, schema=target_schema, preserve_index=False)
 
-                def filter_new_event_rows(table_block, existing_hash_set, new_seen_hashes_set):
-                    if "hash_id" not in table_block.column_names:
-                        return table_block
-
-                    hash_col = table_block.column("hash_id")
-
-                    if existing_hash_set is not None and len(existing_hash_set) > 0:
-                        hashes = [str(h) for h in hash_col.to_pylist() if h is not None]
-                        keep_indexes = [idx for idx, h in enumerate(hashes) if h not in existing_hash_set]
-                        if not keep_indexes:
-                            return table_block.slice(0, 0)
-                        if len(keep_indexes) != table_block.num_rows:
-                            table_block = table_block.take(pa.array(keep_indexes, type=pa.int64()))
-                        hash_col = table_block.column("hash_id")
-
-                    if table_block.num_rows == 0:
-                        return table_block
-
-                    # 2. IN-MEMORY SET FILTER for new rows within this run
-                    keep_indexes = []
-                    hash_list = hash_col.to_pylist()
-                    for row_idx, h in enumerate(hash_list):
-                        dedup_key = "" if h is None else str(h)
-                        if dedup_key not in new_seen_hashes_set:
-                            new_seen_hashes_set.add(dedup_key)
-                            keep_indexes.append(row_idx)
-
-                    if not keep_indexes:
-                        return table_block.slice(0, 0)
-                    if len(keep_indexes) == table_block.num_rows:
-                        return table_block
-
-                    return table_block.take(pa.array(keep_indexes, type=pa.int64()))
-
                 if not merge_success:
                     source_schemas = []
                     if final_target_path.exists():
@@ -1427,43 +1635,150 @@ def run_cleanup_and_merge():
                     if not source_schemas:
                         continue
 
+                    # Every shard for this group was corrupt or unreadable, so there is
+                    # nothing to merge and no reason to pay for hashing the archive.
+                    if not readable_segments and final_target_path.exists():
+                        log(f"  [SKIP REWRITE] No readable source shards for {final_name}. Keeping existing file.")
+                        write_manifest_ids(manifest_path, processed_ids)
+
+                        for seg_path in consumable_segments:
+                            archive_ingested_source(seg_path)
+
+                        continue
+
                     target_schema = resolve_compatible_schema(source_schemas)
                     if "hash_id" not in target_schema.names:
                         target_schema = target_schema.append(pa.field("hash_id", pa.string(), nullable=True))
 
-                    # 1. READ EXISTING HASHES FAST
+                    # 1. LOAD EXISTING ROW HASHES AS COMPACT 128-BIT KEYS
                     existing_needs_full_hash_pass = False
-                    existing_hashes = None
-                    new_seen_hashes_set = set()
+                    existing_keys = np.empty(0, dtype=HASH_KEY_DTYPE)
 
                     if final_target_path.exists():
                         with open(final_target_path, 'rb') as f_ex:
                             pf_ex = pq.ParquetFile(f_ex)
                             if "hash_id" in pf_ex.schema_arrow.names:
                                 log(f"  [FAST PATH] Loading existing hashes for {final_target_path.name}...")
-                                existing_hashes = set()
+                                key_blocks = []
                                 for rg in range(pf_ex.metadata.num_row_groups):
-                                    hash_chunk = read_parquet_safe(pf_ex, columns=["hash_id"], row_group=rg).column("hash_id").to_pylist()
-                                    existing_hashes.update(str(v) for v in hash_chunk if v is not None)
-                                log(f"  [FAST PATH] Loaded {len(existing_hashes):,} existing unique hashes in memory.")
+                                    hash_chunk = read_parquet_safe(pf_ex, columns=["hash_id"], row_group=rg).column("hash_id")
+                                    key_blocks.append(hash_keys_from_column(hash_chunk))
+                                if key_blocks:
+                                    existing_keys = np.unique(np.concatenate(key_blocks))
+                                del key_blocks
+                                gc.collect()
+                                log(f"  [FAST PATH] Loaded {existing_keys.size:,} existing unique hashes "
+                                    f"({existing_keys.nbytes / (1024 * 1024):.0f} MB).")
                             else:
                                 existing_needs_full_hash_pass = True
 
-                    # 2. EXTRACT ONLY TRULY NEW ROWS FROM STAGING FILES
-                    new_row_blocks = []
+                    # 2. SET UP A STREAMING REWRITE THAT ONLY STARTS IF THERE IS NEW DATA
+                    #    New rows go straight to the writer as each row group is read, so
+                    #    memory stays flat no matter how many million rows a shard holds.
+                    #    The target is opened on the first new row, which keeps the old
+                    #    skip-rewrite behaviour for shards that are pure duplicates without
+                    #    paying for a second pass over the staging hashes to discover it.
+                    hash_index = HashKeyIndex(existing_keys)
+                    writer_state = {"writer": None}
+                    coalesce_buffer = []
+                    coalesce_state = {"rows": 0, "bytes": 0}
+                    total_new_rows = 0
+
+                    # Coalesce blocks into ~250k-row row groups on rewrite. Without this,
+                    # every rewrite copies old row groups 1:1 and appends new ones, so the
+                    # group count only grows and each day's fast-copy gets slower. The byte
+                    # ceiling covers wide JSON payloads, where 250k rows is already too much.
+                    COALESCE_TARGET_ROWS = 250_000
+                    COALESCE_TARGET_BYTES = 256 * 1024 * 1024
+
+                    def flush_coalesce_buffer(force=False):
+                        """Write the buffered blocks out as one row group once they earn it."""
+                        if not coalesce_buffer or writer_state["writer"] is None:
+                            return
+                        if (not force
+                                and coalesce_state["rows"] < COALESCE_TARGET_ROWS
+                                and coalesce_state["bytes"] < COALESCE_TARGET_BYTES):
+                            return
+                        writer_state["writer"].write_table(pa.concat_tables(coalesce_buffer))
+                        coalesce_buffer.clear()
+                        coalesce_state["rows"] = 0
+                        coalesce_state["bytes"] = 0
+                        gc.collect()
+
+                    def buffer_block(table_block):
+                        """Queue an aligned block for the writer, flushing when the buffer fills."""
+                        coalesce_buffer.append(table_block)
+                        coalesce_state["rows"] += table_block.num_rows
+                        coalesce_state["bytes"] += table_block.nbytes
+                        flush_coalesce_buffer()
+
+                    def open_target_writer():
+                        """Open the temp target and seed it with the existing archive rows."""
+                        if writer_state["writer"] is not None:
+                            return
+                        writer_state["writer"] = pq.ParquetWriter(
+                            str(temp_target_path),
+                            target_schema,
+                            compression='zstd',
+                            compression_level=ARCHIVE_ZSTD_LEVEL
+                        )
+                        if not final_target_path.exists():
+                            return
+
+                        with open(final_target_path, 'rb') as f_ex:
+                            pf_existing = pq.ParquetFile(f_ex)
+                            existing_pbar = tqdm(
+                                desc=f"  🔵 Fast-copying existing ({final_target_path.name[:20]})",
+                                total=pf_existing.metadata.num_row_groups,
+                                unit="block",
+                                leave=False,
+                                file=sys.stderr
+                            )
+                            for rg in range(pf_existing.metadata.num_row_groups):
+                                table_block = read_parquet_safe(pf_existing, row_group=rg)
+
+                                if existing_needs_full_hash_pass:
+                                    table_block = aligned_event_table(table_block, target_schema)
+                                    table_block = ensure_event_hash_id(table_block, final_name, target_schema)
+                                    table_block = select_unseen_event_rows(table_block, hash_index)
+                                    if table_block.num_rows == 0:
+                                        existing_pbar.update(1)
+                                        continue
+                                else:
+                                    # Fast path: natively cast to target schema (lightning fast, no pandas)
+                                    if not table_block.schema.equals(target_schema):
+                                        try:
+                                            table_block = table_block.cast(target_schema)
+                                        except pa.ArrowInvalid:
+                                            table_block = aligned_event_table(table_block, target_schema)
+
+                                buffer_block(table_block)
+                                existing_pbar.update(1)
+                                del table_block
+                            existing_pbar.close()
+
+                    if existing_needs_full_hash_pass:
+                        # Existing rows carry no hash_id, so they have to be hashed and
+                        # written before staging rows can be compared against them.
+                        open_target_writer()
+
+                    # 3. STREAM ONLY TRULY NEW ROWS OUT OF THE STAGING SHARDS
                     for seg_path in readable_segments:
                         salvaged_table = _salvaged_tables.pop(str(seg_path), None)
                         if salvaged_table is not None:
                             try:
                                 table_block = aligned_event_table(salvaged_table, target_schema)
                                 table_block = ensure_event_hash_id(table_block, final_name, target_schema)
-                                table_block = filter_new_event_rows(table_block, existing_hashes, new_seen_hashes_set)
+                                table_block = select_unseen_event_rows(table_block, hash_index)
                                 if table_block.num_rows > 0:
-                                    new_row_blocks.append(table_block)
+                                    total_new_rows += table_block.num_rows
+                                    open_target_writer()
+                                    buffer_block(table_block)
                                 consumable_segments.append(seg_path)
                                 processed_ids.add(source_shard_id(seg_path))
                             except Exception as sv_ex:
                                 log(f"  [SALVAGE WRITE FAIL] {seg_path.name}: {sv_ex}", is_warning=True)
+                            del salvaged_table
                             gc.collect()
                             continue
 
@@ -1482,9 +1797,11 @@ def run_cleanup_and_merge():
                                     try:
                                         table_block = aligned_event_table(read_parquet_safe(pf, row_group=rg), target_schema)
                                         table_block = ensure_event_hash_id(table_block, final_name, target_schema)
-                                        table_block = filter_new_event_rows(table_block, existing_hashes, new_seen_hashes_set)
+                                        table_block = select_unseen_event_rows(table_block, hash_index)
                                         if table_block.num_rows > 0:
-                                            new_row_blocks.append(table_block)
+                                            total_new_rows += table_block.num_rows
+                                            open_target_writer()
+                                            buffer_block(table_block)
                                     except Exception as rg_ex:
                                         rg_failures += 1
                                         log(f"  [SKIP ROW GROUP {rg}] {seg_path.name}: {rg_ex}", is_warning=True)
@@ -1492,7 +1809,6 @@ def run_cleanup_and_merge():
                                         sub_pbar.update(1)
                                         if 'table_block' in locals():
                                             del table_block
-                                            gc.collect()
                                 sub_pbar.close()
                                 if rg_failures == 0:
                                     consumable_segments.append(seg_path)
@@ -1506,89 +1822,30 @@ def run_cleanup_and_merge():
                         except Exception as seg_read_ex:
                             log(f"  [CORRUPT DURING MERGE] {seg_path.name}: {seg_read_ex} — quarantining", is_warning=True)
                             quarantine_file(seg_path)
-                        gc.collect()
 
-                    # 3. IF NOTHING NEW TO ADD, ABORT THE REWRITE ENTIRELY!
-                    if not new_row_blocks and not existing_needs_full_hash_pass and final_target_path.exists():
-                        log(f"  [SKIP REWRITE] No new unique rows found for {final_name}. Keeping existing file.")
-                        write_manifest_ids(manifest_path, processed_ids)
-                        
-                        # Fix: Actually delete the staging files before continuing to the next table!
-                        for seg_path in consumable_segments:
-                            archive_ingested_source(seg_path)
-                            
-                        continue
+                    # 4. IF NOTHING NEW WAS FOUND, THE ARCHIVE WAS NEVER TOUCHED
+                    #    Every staging row was already present, so the shards are redundant
+                    #    and safe to consume without rewriting a multi-gigabyte target.
+                    if writer_state["writer"] is None:
+                        if final_target_path.exists():
+                            log(f"  [SKIP REWRITE] No new unique rows found for {final_name}. Keeping existing file.")
+                            write_manifest_ids(manifest_path, processed_ids)
 
-                    # 4. PERFORM THE REWRITE (FAST-COPY EXISTING, THEN APPEND NEW)
-                    parquet_writer = pq.ParquetWriter(
-                        str(temp_target_path),
-                        target_schema,
-                        compression='zstd',
-                        compression_level=ARCHIVE_ZSTD_LEVEL
-                    )
+                            for seg_path in consumable_segments:
+                                archive_ingested_source(seg_path)
 
-                    # Coalesce blocks into ~250k-row row groups on rewrite. Without this,
-                    # every rewrite copies old row groups 1:1 and appends new ones, so the
-                    # group count only grows and each day's fast-copy gets slower.
-                    coalesce_buffer = []
-                    coalesce_rows = 0
-                    COALESCE_TARGET_ROWS = 250_000
+                            continue
 
-                    if final_target_path.exists():
-                        with open(final_target_path, 'rb') as f_ex:
-                            pf_existing = pq.ParquetFile(f_ex)
-                            existing_pbar = tqdm(
-                                desc=f"  🔵 Fast-copying existing ({final_target_path.name[:20]})",
-                                total=pf_existing.metadata.num_row_groups,
-                                unit="block",
-                                leave=False,
-                                file=sys.stderr
-                            )
-                            for rg in range(pf_existing.metadata.num_row_groups):
-                                table_block = read_parquet_safe(pf_existing, row_group=rg)
-                                
-                                if existing_needs_full_hash_pass:
-                                    table_block = aligned_event_table(table_block, target_schema)
-                                    table_block = ensure_event_hash_id(table_block, final_name, target_schema)
-                                    table_block = filter_new_event_rows(table_block, None, new_seen_hashes_set)
-                                    if table_block.num_rows == 0:
-                                        existing_pbar.update(1)
-                                        continue
-                                else:
-                                    # Fast path: natively cast to target schema (lightning fast, no pandas)
-                                    if not table_block.schema.equals(target_schema):
-                                        try:
-                                            table_block = table_block.cast(target_schema)
-                                        except pa.ArrowInvalid:
-                                            table_block = aligned_event_table(table_block, target_schema)
-                                            
-                                coalesce_buffer.append(table_block)
-                                coalesce_rows += table_block.num_rows
-                                if coalesce_rows >= COALESCE_TARGET_ROWS:
-                                    parquet_writer.write_table(pa.concat_tables(coalesce_buffer))
-                                    coalesce_buffer.clear()
-                                    coalesce_rows = 0
-                                    gc.collect()
-                                existing_pbar.update(1)
-                                del table_block
-                            existing_pbar.close()
+                        # Nothing new and no target yet: materialize the empty table anyway so
+                        # this group is not rescanned on every future run.
+                        open_target_writer()
 
-                    # Write all new rows held in memory (through the same coalescing buffer)
-                    total_new_rows = 0
-                    for table_block in new_row_blocks:
-                        coalesce_buffer.append(table_block)
-                        coalesce_rows += table_block.num_rows
-                        total_new_rows += table_block.num_rows
-                        if coalesce_rows >= COALESCE_TARGET_ROWS:
-                            parquet_writer.write_table(pa.concat_tables(coalesce_buffer))
-                            coalesce_buffer.clear()
-                            coalesce_rows = 0
+                    flush_coalesce_buffer(force=True)
+                    writer_state["writer"].close()
 
-                    if coalesce_buffer:
-                        parquet_writer.write_table(pa.concat_tables(coalesce_buffer))
-                        coalesce_buffer.clear()
-
-                    parquet_writer.close()
+                    del hash_index
+                    del existing_keys
+                    gc.collect()
 
                     if temp_target_path.exists():
                         temp_target_path.replace(final_target_path)

@@ -20,4 +20,4 @@ otherScripts/*
 
 !otherScripts/utilityScripts/
 otherScripts/utilityScripts/*
-!otherScripts/utilityScripts/clean_and_merge.py
+!otherScripts/utilityScripts/cleanAndMerge.py

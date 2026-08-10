@@ -9,7 +9,7 @@ Built with the MBTA in mind, but designed to be adaptable to any transit agency 
 
 Data is archived to JSONL (real-time write-ahead log) and Parquet (compressed analytics format) using queue-based asynchronous writers optimized for continuous ingestion.
 
-Configuration lives directly in the compose files. [`docker-compose.yaml`](https://github.com/mxdrew/gtfs-data-archiver/blob/main/docker-compose.yaml) contains MBTA values as a default.
+Configuration lives directly in the compose files. [`docker-compose.yaml`](https://github.com/mxdrew/gtfsDataArchiver/blob/main/docker-compose.yaml) contains MBTA values as a default.
 
 This project aims to adhere to the [MassDOT Developers License Agreement](https://cdn.mbta.com/sites/default/files/2023-08/mbta-massdot-develop-license-agreement.pdf). Any data collected is owned by the provider (MBTA & MassDOT) and is not claimed by this project.
 
@@ -37,8 +37,8 @@ This project aims to adhere to the [MassDOT Developers License Agreement](https:
   - [Multiple Agencies](#multiple-agencies)
     - [Example Compose Files](#example-compose-files)
 - [Extra Scripts](#extra-scripts)
-  - [`ma_gtfs_archiver.py`](#ma_gtfs_archiverpy)
-  - [`clean_and_merge.py`](#clean_and_mergepy)
+  - [`maGTFSArchiver.py`](#magtfsarchiverpy)
+  - [`cleanAndMerge.py`](#cleanandmergepy)
 - [Installation](#installation)
   - [Docker (Recommended)](#docker-recommended)
   - [Manual](#manual)
@@ -98,16 +98,16 @@ This project aims to adhere to the [MassDOT Developers License Agreement](https:
 
 ## Data Schema
 
-All schema definitions are intentionally centralized in [**DATA.md**](https://github.com/mxdrew/gtfs-data-archiver/blob/main/DATA.md) to avoid duplication and drift.
+All schema definitions are intentionally centralized in [**DATA.md**](https://github.com/mxdrew/gtfsDataArchiver/blob/main/DATA.md) to avoid duplication and drift.
 
 Static GTFS uses stable per-table files named `AGENCY_NAME_gtfs_<table>.parquet`, with `first_logged` and `last_logged` metadata tracking the exact timestamp when each unique row was first and most recently seen. These files accumulate indefinitely and are never pruned.
 
 Event-stream archives (`AGENCY_NAME_<endpoint>_<MMDDYYYY>.parquet`) are dated per day and are automatically deleted once they're older than `EVENT_RETENTION_DAYS` (default: 30 days).
 
 See:
-- `data/events/` → [DATA.md](https://github.com/mxdrew/gtfs-data-archiver/blob/main/DATA.md#1-dataevents-active-write-ahead-logs) (Active ingestion schema)
-- `data/archive/` → [DATA.md](https://github.com/mxdrew/gtfs-data-archiver/blob/main/DATA.md#2-dataarchive-compacted-event-logs) (Compacted analytical schema)
-- `data/archive/gtfs/` → [DATA.md](https://github.com/mxdrew/gtfs-data-archiver/blob/main/DATA.md#3-dataarchivegtfs-static-schedule-data) (Static GTFS schema)
+- `data/events/` → [DATA.md](https://github.com/mxdrew/gtfsDataArchiver/blob/main/DATA.md#1-dataevents-active-write-ahead-logs) (Active ingestion schema)
+- `data/archive/` → [DATA.md](https://github.com/mxdrew/gtfsDataArchiver/blob/main/DATA.md#2-dataarchive-compacted-event-logs) (Compacted analytical schema)
+- `data/archive/gtfs/` → [DATA.md](https://github.com/mxdrew/gtfsDataArchiver/blob/main/DATA.md#3-dataarchivegtfs-static-schedule-data) (Static GTFS schema)
 
 ## Directory Structure
 
@@ -194,7 +194,7 @@ Further info on which variables are used in files from `otherScripts/` is in the
 | `LOG_LEVEL` | Logging verbosity | `warning` |
 | `ARCHIVE_ZSTD_LEVEL` | Parquet compression level used for archive files | `10` |
 | `EVENT_RETENTION_DAYS` | Days to retain compacted event-stream Parquet archives before automatic deletion. Static GTFS tables are never affected. `0` or a negative value disables cleanup. | `30` |
-| `GTFS_DOWNLOAD_USER_AGENT` | User-Agent header sent on static GTFS ZIP downloads. Optional here, but required by `ma_gtfs_archiver.py` (see [Extra Scripts](#extra-scripts)). | `gtfs-data-archiver/1.0 (+repo URL)` |
+| `GTFS_DOWNLOAD_USER_AGENT` | User-Agent header sent on static GTFS ZIP downloads. Optional here, but required by `maGTFSArchiver.py` (see [Extra Scripts](#extra-scripts)). | `gtfsDataArchiver/1.0 (+repo URL)` |
 
 ### Required For Any Run
 
@@ -325,14 +325,14 @@ docker compose -f docker-compose.yaml up -d --build
 ## Extra Scripts
 
 The `otherScripts/` folder contains two companion scripts to the main archiver: 
-- [`ma_gtfs_archiver.py`](#ma_gtfs_archiverpy), a multi-agency ingestion runner.
-- [`clean_and_merge.py`](#clean_and_mergepy), a post-processing pipeline.
+- [`maGTFSArchiver.py`](#maGTFSArchiverpy), a multi-agency ingestion runner.
+- [`cleanAndMerge.py`](#cleanAndMergepy), a post-processing pipeline.
 
 Both scripts resolve their `.env` the same way: a `.env` sitting alongside the script (`otherScripts/.env`) is used if present; otherwise the search walks up parent directories and falls back to the repo-root `.env`. In practice this means a single root `.env` configures everything, and an `otherScripts/.env` can optionally override it for just the helper scripts.
 
-### `ma_gtfs_archiver.py`
+### `maGTFSArchiver.py`
 
-A multi-agency ingestion runner, [`ma_gtfs_archiver.py`](https://github.com/mxdrew/gtfs-data-archiver/blob/main/otherScripts/ma_gtfs_archiver.py) handles static GTFS pulls across 32+ agencies — including the MBTA, all 15 Massachusetts Regional Transit Authorities, private bus carriers (Coach Company, DATTCO, Peter Pan, Plymouth & Brockton, Yankee Line), ferry services (Bay State Cruise, Block Island Ferry, Cuttyhunk, Freedom Cruise Line, Hy-Line Cruises, Patriot Party Boats, Seastreak, Vineyard Fast Ferry, Steamship Authority), Massport/Logan Express, Lexpress, and Amtrak — with optional MBTA live ingestion.
+A multi-agency ingestion runner, [`maGTFSArchiver.py`](https://github.com/mxdrew/gtfsDataArchiver/blob/main/otherScripts/maGTFSArchiver.py) handles static GTFS pulls across 32+ agencies — including the MBTA, all 15 Massachusetts Regional Transit Authorities, private bus carriers (Coach Company, DATTCO, Peter Pan, Plymouth & Brockton, Yankee Line), ferry services (Bay State Cruise, Block Island Ferry, Cuttyhunk, Freedom Cruise Line, Hy-Line Cruises, Patriot Party Boats, Seastreak, Vineyard Fast Ferry, Steamship Authority), Massport/Logan Express, Lexpress, and Amtrak — with optional MBTA live ingestion.
 
 Environment variables read (from `otherScripts/.env`):
 
@@ -351,15 +351,15 @@ Output is written to `./data` relative to the working directory the script is la
 
 _**DISCLAIMER**: <u>Live real-time ingestion is only recommended for the MBTA.</u> Static GTFS downloads are published for public consumption, but most agencies' real-time endpoints are not — they exist to feed the agency's own live maps and rider apps, are undocumented and unsupported for third-party use, and may change or vanish without notice. Continuously polling them can put real load on systems that actual riders depend on, and may get your IP blocked. The MBTA is the exception: its [V3 API](https://www.mbta.com/developers/v3-api) and enhanced feeds are publicly documented and intended for developer use. If you choose to ingest live data from any other agency anyway, you do so at your own discretion and risk — review the relevant code carefully, consider whether you _<u>realllllyyyyy</u>_ want to run it, and test in an isolated environment first._
 
-### `clean_and_merge.py`
+### `cleanAndMerge.py`
 
-A post-processing pipeline that consolidates raw archiver output into clean, unified historical datasets. [`clean_and_merge.py`](https://github.com/mxdrew/gtfs-data-archiver/blob/main/otherScripts/clean_and_merge.py) standardizes shard filenames in place, converts any remaining JSONL write-ahead logs into ZSTD-compressed Parquet, then classifies and merges daily shards — static GTFS tables are deduplicated by SHA-256 `hash_id` while preserving `first_logged`/`last_logged` observation windows, and event streams are compacted into per-type archives. Corrupt or partially-written Parquet files are automatically repaired where possible (tolerant row-group reads, footer reconstruction for truncated files); unrecoverable files are quarantined rather than silently dropped. A strict overwrite guard ensures existing archives are never clobbered — merges write to temp files and atomically replace their targets.
+A post-processing pipeline that consolidates raw archiver output into clean, unified historical datasets. [`cleanAndMerge.py`](https://github.com/mxdrew/gtfsDataArchiver/blob/main/otherScripts/cleanAndMerge.py) standardizes shard filenames in place, converts any remaining JSONL write-ahead logs into ZSTD-compressed Parquet, then classifies and merges daily shards — static GTFS tables are deduplicated by SHA-256 `hash_id` while preserving `first_logged`/`last_logged` observation windows, and event streams are compacted into per-type archives. Corrupt or partially-written Parquet files are automatically repaired where possible (tolerant row-group reads, footer reconstruction for truncated files); unrecoverable files are quarantined rather than silently dropped. A strict overwrite guard ensures existing archives are never clobbered — merges write to temp files and atomically replace their targets.
 
 Environment variables read (from the repo-root `.env`):
 
 | Variable | Description |
 |-|-|
-| `DATA_DIR_WSL` | Final archive directory. Accepts Windows (`D:\gtfs-data`) or WSL (`/mnt/d/gtfs-data`) style paths; translated automatically for the current platform. Falls back to the current directory if unset. |
+| `DATA_DIR_WSL` | Final archive directory. Accepts Windows (`Z:\gtfs-archiver-data`) or WSL (`/mnt/z/gtfs-archiver-data`) style paths; translated automatically for the current platform. Falls back to the current directory if unset. |
 | `STAGING_DIR_WSL` | Staging directory holding incoming shards; same path translation as above. Falls back to `DATA_DIR_WSL` if unset. |
 | `SYNC_TIMEZONE` | Optional. IANA timezone for log timestamps (default: UTC). |
 | `ARCHIVE_ZSTD_LEVEL` | Optional. Parquet compression level (default: `12`). |
@@ -371,8 +371,8 @@ Environment variables read (from the repo-root `.env`):
 ### Docker (Recommended)
 
 ```bash
-git clone https://github.com/mxdrew/gtfs-data-archiver.git
-cd gtfs-data-archiver
+git clone https://github.com/mxdrew/gtfsDataArchiver.git
+cd gtfsDataArchiver
 docker compose up -d --build
 ```
 
@@ -381,13 +381,13 @@ If you add another agency later, use the copy pattern shown above in the Multipl
 ### Manual
 
 ```bash
-git clone https://github.com/mxdrew/gtfs-data-archiver.git
-cd gtfs-data-archiver
+git clone https://github.com/mxdrew/gtfsDataArchiver.git
+cd gtfsDataArchiver
 pip install -r requirements.txt
-python gtfs_archiver.py
+python gtfsArchiver.py
 ```
 
-For manual runs, use the included `.env` sample as the starting point: [`.env`](https://github.com/mxdrew/gtfs-data-archiver/blob/main/.env). Update the values that make the agency unique, especially `AGENCY_NAME`, `SYNC_TIMEZONE`, `API_KEY`, `BASE_URL`, `GTFS_URL`, `BASE_STREAMS`, `ROUTE_STREAMS`, `SNAPSHOT_EPS`, the `VEHICLES_ENHANCED_URL`/`ALERTS_ENHANCED_URL`/`TRIPS_ENHANCED_URL` entries, `GTFS_DOWNLOAD_USER_AGENT`, and the `ENABLE_*` flags. I did not try multiple agencies with this, but I'd imagine in order to do so you'd need to clone `gtfs_archiver.py` and `.env`, rename them, update the new `.env` file, and then launch the cloned script.
+For manual runs, use the included `.env` sample as the starting point: [`.env`](https://github.com/mxdrew/gtfsDataArchiver/blob/main/.env). Update the values that make the agency unique, especially `AGENCY_NAME`, `SYNC_TIMEZONE`, `API_KEY`, `BASE_URL`, `GTFS_URL`, `BASE_STREAMS`, `ROUTE_STREAMS`, `SNAPSHOT_EPS`, the `VEHICLES_ENHANCED_URL`/`ALERTS_ENHANCED_URL`/`TRIPS_ENHANCED_URL` entries, `GTFS_DOWNLOAD_USER_AGENT`, and the `ENABLE_*` flags. I did not try multiple agencies with this, but I'd imagine in order to do so you'd need to clone `gtfsArchiver.py` and `.env`, rename them, update the new `.env` file, and then launch the cloned script.
 
 ## Operational Notes
 

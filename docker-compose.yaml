@@ -1,7 +1,7 @@
 services:
   gtfs-archiver:
     build: .
-    container_name: gtfs-data-archiver
+    container_name: gtfsDataArchiver
     restart: unless-stopped
     environment:
       # Core settings and stream controls
@@ -35,7 +35,7 @@ services:
       - ARCHIVE_ZSTD_LEVEL=10
       - EVENT_RETENTION_DAYS=30
 
-      # Identifies your archiver to GTFS hosts (optional here; required by ma_gtfs_archiver.py)
-      - GTFS_DOWNLOAD_USER_AGENT=gtfs-data-archiver/1.0 (+https://github.com/YOUR_USERNAME/your-fork)
+      # Identifies your archiver to GTFS hosts (optional here; required by maGTFSArchiver.py)
+      - GTFS_DOWNLOAD_USER_AGENT=gtfsDataArchiver/1.0 (+https://github.com/YOUR_USERNAME/your-fork)
     volumes:
       - ./data:/app/data

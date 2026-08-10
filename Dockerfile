@@ -19,4 +19,4 @@ COPY gtfs_archiver.py .
 RUN mkdir -p /app/data
 
 # -u disables output buffering so Docker logs stream in real time
-CMD ["python", "-u", "gtfs_archiver.py"]
+CMD ["python", "-u", "gtfsArchiver.py"]

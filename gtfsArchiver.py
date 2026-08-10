@@ -2,12 +2,13 @@
 # Author Information:
 # Drew Mulcare
 # github@mxdrew.com
-# May 25, 2026 (Last updated August 06, 2026)
+# May 25, 2026 (Last updated July 29, 2026)
 #
 # Description:
-# Multi-agency runner for static GTFS and optional MBTA live ingestion.
-# Pulls Massachusetts regional transit authority static GTFS feeds and can
-# also ingest MBTA live data streams in the same process.
+# Lightweight, single-process data ingestion engine for real-time and static transit feeds. 
+# Captures live Server-Sent Events (SSE) with dynamic route batching, polls enhanced bulk 
+# JSON endpoints, executes hourly contextual REST snapshots, and manages cumulative static GTFS 
+# history for each agency.
 #
 # Data Integrity & Storage:
 # Implements a crash-proof Write-Ahead Log (WAL) pattern. All network records are instantly 
@@ -36,7 +37,7 @@
 #
 # License:
 # BSD 3-Clause License
-# Find the full agreement at https://github.com/mxdrew/gtfs-data-logger/blob/main/LICENSE
+# Find the full agreement at https://github.com/mxdrew/gtfsDataArchiver/blob/main/LICENSE
 
 import os
 import io
@@ -48,11 +49,9 @@ import zipfile
 import threading
 import hashlib
 import tempfile
-import logging
 from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -62,26 +61,17 @@ import pyarrow.parquet as pq
 from dotenv import load_dotenv
 from urllib3.util.retry import Retry
 
-# Load environment variables: prefer a .env alongside this script, otherwise walk
-# up parent directories (otherScripts/, then the repo root) and use the first found.
-for _env_dir in Path(__file__).resolve().parents:
-    _env_candidate = _env_dir / ".env"
-    if _env_candidate.exists():
-        load_dotenv(_env_candidate)
-        break
+# Load environment variables
+load_dotenv()
 
-# Setup logging
-logging.basicConfig(level=logging.WARNING)
-logger = logging.getLogger("TransitArchiver")
-
-
-#### GLOBAL CONFIGURATION ####
+#### CONFIGURATION ####
 
 def env_text(name, default=""):
     val = os.environ.get(name)
     if val is None:
         val = default
     return str(val).strip()
+
 
 def env_int(name, default):
     raw_value = env_text(name, str(default))
@@ -91,39 +81,40 @@ def env_int(name, default):
         return default
 
 
-def env_required(name):
-    value = env_text(name)
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
+def env_float(name, default):
+    raw_value = env_text(name, str(default))
+    try:
+        return float(raw_value)
+    except ValueError:
+        return default
 
-
-def env_flag(name):
-    return env_required(name).lower() == "true"
-
-
-def env_list(name):
-    raw_value = env_required(name)
-    return [value.strip() for value in raw_value.split(",") if value.strip()]
 
 LOCAL_TZ = ZoneInfo(env_text("SYNC_TIMEZONE"))
-LOG_LEVEL = env_text("LOG_LEVEL", "info").lower() or "info"
+API_KEY = env_text("API_KEY")
+BASE_URL = env_text("BASE_URL")
+GTFS_URL = env_text("GTFS_URL")
+AGENCY_NAME = env_text("AGENCY_NAME", "agency") or "agency"
 
-ARCHIVE_ZSTD_LEVEL = env_int("ARCHIVE_ZSTD_LEVEL", 10)
 
-# Event-stream parquet retention. Applies only to dated event-stream archives
-# (e.g. MBTA_vehicles_07012026.parquet) directly under ARCHIVE_DIR. Static
-# GTFS tables live under ARCHIVE_DIR/gtfs/ with stable, non-dated filenames and
-# are never touched by this. Set to 0 (or a negative value) to disable cleanup.
-EVENT_RETENTION_DAYS = env_int("EVENT_RETENTION_DAYS", 30)
+def env_flag(name, default="false"):
+    val = os.environ.get(name)
+    if val is None:
+        val = default
+    return str(val).strip().lower() == "true"
 
-DEFAULT_BATCH_SIZE = env_int("DEFAULT_BATCH_SIZE", 25)
-PREDICTIONS_BATCH_SIZE = env_int("PREDICTIONS_BATCH_SIZE", max(DEFAULT_BATCH_SIZE, 75))
-SNAPSHOT_RETRY_MINUTES = env_int("SNAPSHOT_RETRY_MINUTES", 10)
 
-# Tracks agencies whose snapshot pulls had failures so the scheduler can retry sooner.
-_snapshot_retry_lock = threading.Lock()
-_snapshot_retry_queue = {}  # agency_prefix -> (retry_after_datetime, agency_dict)
+def env_list(name, default=""):
+    raw_value = env_text(name, default)
+    return [value.strip() for value in raw_value.split(",") if value.strip()]
+
+
+def safe_prefix(value):
+    cleaned_value = re.sub(r"[^A-Za-z0-9_-]+", "_", value.strip())
+    return cleaned_value.strip("_") or "agency"
+
+
+AGENCY_PREFIX = safe_prefix(AGENCY_NAME)
+AGENCY_LOG_LABEL = AGENCY_NAME.strip() or AGENCY_PREFIX
 
 DATA_DIR = Path("data")
 EVENTS_DIR = DATA_DIR / "events"
@@ -133,91 +124,66 @@ GTFS_DIR = ARCHIVE_DIR / "gtfs"
 for d in [EVENTS_DIR, ARCHIVE_DIR, GTFS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
+ENABLE_BASE_STREAMS = env_flag("ENABLE_BASE_STREAMS", "true")
+ENABLE_ROUTE_STREAMS = env_flag("ENABLE_ROUTE_STREAMS", "true")
+ENABLE_SNAPSHOT_PULLS = env_flag("ENABLE_SNAPSHOT_PULLS", "true")
+ENABLE_ENHANCED_STREAMS = env_flag("ENABLE_ENHANCED_STREAMS", "true")
+ENABLE_GTFS_STATIC = env_flag("ENABLE_GTFS_STATIC", "true")
+
 GTFS_DOWNLOAD_HEADERS = {
     "Accept": "application/zip,application/octet-stream,*/*",
-    "User-Agent": env_required("GTFS_DOWNLOAD_USER_AGENT"),
+    # Keep user-agent configurable from .env without adding extra module globals.
+    "User-Agent": env_text("GTFS_DOWNLOAD_USER_AGENT"),
 }
 
+# 1. Base Streams
+BASE_STREAMS = env_list("BASE_STREAMS")
 
-#### MULTI-AGENCY CONFIGURATION DICTIONARY ####
+# 2. Batched Streams
+ROUTE_STREAMS = env_list("ROUTE_STREAMS")
 
-AGENCIES = [
-    {
-        "name": "MBTA",
-        "prefix": "MBTA",
-        "base_url": "https://api-v3.mbta.com",
-        "gtfs_url": "https://cdn.mbta.com/MBTA_GTFS.zip",
-        "api_key": env_text("MBTA_API_KEY"),
-        "enable_base_streams": True,
-        "enable_route_streams": True,
-        "enable_snapshot_pulls": True,
-        "enable_enhanced_streams": True,
-        "enable_gtfs_static": True,
-        "base_streams": ["vehicles", "alerts"],
-        "route_streams": ["predictions", "stop_events"],
-        "snapshot_eps": [
-            "schedules", "services", "shapes", "trips", "lines", "routes",
-            "route_patterns", "facilities", "stops", "live_facilities"
-        ],
-        "enhanced_poll_interval": 7,
-        "enhanced_streams": {
-            "vehicles_enhanced": "https://cdn.mbta.com/realtime/VehiclePositions_enhanced.json",
-            "alerts_enhanced": "https://cdn.mbta.com/realtime/Alerts_enhanced.json",
-            "trips_enhanced": "https://cdn.mbta.com/realtime/TripUpdates_enhanced.json"
-        }
-    },
-    # Regional Transit Authorities
-    {"name": "BRTA",          "prefix": "BRTA",          "gtfs_url": "https://data.trilliumtransit.com/gtfs/berkshire-ma-us/berkshire-ma-us.zip",                        "enable_gtfs_static": True},
-    {"name": "BAT",           "prefix": "BAT",           "gtfs_url": "https://data.trilliumtransit.com/gtfs/brockton-ma-us/brockton-ma-us.zip",                          "enable_gtfs_static": True},
-    {"name": "CATA",          "prefix": "CATA",          "gtfs_url": "https://data.trilliumtransit.com/gtfs/capeann-ma-us/capeann-ma-us.zip",                            "enable_gtfs_static": True},
-    {"name": "CCRTA",         "prefix": "CCRTA",         "gtfs_url": "https://data.trilliumtransit.com/gtfs/capecod-ma-us/capecod-ma-us.zip",                            "enable_gtfs_static": True},
-    {"name": "FRTA",          "prefix": "FRTA",          "gtfs_url": "https://data.trilliumtransit.com/gtfs/frta-ma-us/frta-ma-us.zip",                                  "enable_gtfs_static": True},
-    {"name": "GATRA",         "prefix": "GATRA",         "gtfs_url": "https://data.trilliumtransit.com/gtfs/gatra-ma-us/gatra-ma-us.zip",                                "enable_gtfs_static": True},
-    {"name": "LRTA",          "prefix": "LRTA",          "gtfs_url": "https://data.trilliumtransit.com/gtfs/lowell-ma-us/lowell-ma-us.zip",                              "enable_gtfs_static": True},
-    {"name": "MVRTA",         "prefix": "MVRTA",         "gtfs_url": "https://data.trilliumtransit.com/gtfs/merrimackvalley-ma-us/merrimackvalley-ma-us.zip",             "enable_gtfs_static": True},
-    {"name": "MWRTA",         "prefix": "MWRTA",         "gtfs_url": "http://vc.mwrta.com/gtfs/google_transit.zip",                                                      "enable_gtfs_static": True},
-    {"name": "MART",          "prefix": "MART",          "gtfs_url": "https://data.trilliumtransit.com/gtfs/montachusett-ma-us/montachusett-ma-us.zip",                  "enable_gtfs_static": True},
-    {"name": "NRTA",          "prefix": "NRTA",          "gtfs_url": "https://data.trilliumtransit.com/gtfs/nantucket-ma-us/nantucket-ma-us.zip",                        "enable_gtfs_static": True},
-    {"name": "PVTA",          "prefix": "PVTA",          "gtfs_url": "http://www.pvta.com/g_trans/google_transit.zip",                                                    "enable_gtfs_static": True},
-    {"name": "VTA",           "prefix": "VTA",           "gtfs_url": "https://data.trilliumtransit.com/gtfs/marthasvineyard-ma-us/marthasvineyard-ma-us.zip",             "enable_gtfs_static": True},
-    {"name": "WRTA",          "prefix": "WRTA",          "gtfs_url": "https://data.trilliumtransit.com/gtfs/wrta-ma-us/wrta-ma-us.zip",                                  "enable_gtfs_static": True},
-    {"name": "SRTA",          "prefix": "SRTA",          "gtfs_url": "https://data.trilliumtransit.com/gtfs/srta-ma-us/srta-ma-us.zip",                                  "enable_gtfs_static": True},
-    # Private bus carriers
-    {"name": "YANKEE",        "prefix": "YANKEE",        "gtfs_url": "https://data.trilliumtransit.com/gtfs/yankeeline-ma-us/yankeeline-ma-us.zip",                      "enable_gtfs_static": True},
-    {"name": "COACH",         "prefix": "COACH",         "gtfs_url": "https://data.trilliumtransit.com/gtfs/coachcompany-ma-us/coachcompany-ma-us.zip",                  "enable_gtfs_static": True},
-    {"name": "DATTCO",        "prefix": "DATTCO",        "gtfs_url": "https://data.trilliumtransit.com/gtfs/dattco-ma-us/dattco-ma-us.zip",                              "enable_gtfs_static": True},
-    {"name": "PETERPAN",      "prefix": "PETERPAN",      "gtfs_url": "https://data.trilliumtransit.com/gtfs/peterpan-ma-us/peterpan-ma-us.zip",                          "enable_gtfs_static": True},
-    {"name": "PBSC",          "prefix": "PBSC",          "gtfs_url": "https://data.trilliumtransit.com/gtfs/plymouthbrockton-ma-us/plymouthbrockton-ma-us.zip",           "enable_gtfs_static": True},
-    # Massport / Logan Express
-    {"name": "MASSPORT",      "prefix": "MASSPORT",      "gtfs_url": "https://data.trilliumtransit.com/gtfs/massport-ma-us/massport-ma-us.zip",                      "enable_gtfs_static": True},
-    # Ferry services
-    {"name": "BAYSTATE",      "prefix": "BAYSTATE",      "gtfs_url": "https://data.trilliumtransit.com/gtfs/baystatecruisecompany-ma-us/baystatecruisecompany-ma-us.zip", "enable_gtfs_static": True},
-    {"name": "BLOCKISLAND",   "prefix": "BLOCKISLAND",   "gtfs_url": "https://data.trilliumtransit.com/gtfs/blockislandferry-ri-us/blockislandferry-ri-us.zip",           "enable_gtfs_static": True},
-    {"name": "CUTTYHUNK",     "prefix": "CUTTYHUNK",     "gtfs_url": "https://data.trilliumtransit.com/gtfs/cuttyhunkferryco-ma-us/cuttyhunkferryco-ma-us.zip",           "enable_gtfs_static": True},
-    {"name": "FREEDOMCRUISE", "prefix": "FREEDOMCRUISE", "gtfs_url": "https://data.trilliumtransit.com/gtfs/freedomcruiseline-ma-us/freedomcruiseline-ma-us.zip",         "enable_gtfs_static": True},
-    {"name": "HYLINE",        "prefix": "HYLINE",        "gtfs_url": "https://data.trilliumtransit.com/gtfs/hylinecruises-ma-us/hylinecruises-ma-us.zip",                "enable_gtfs_static": True},
-    {"name": "PATRIOT",       "prefix": "PATRIOT",       "gtfs_url": "https://data.trilliumtransit.com/gtfs/patriotpartyboats-ma-us/patriotpartyboats-ma-us.zip",         "enable_gtfs_static": True},
-    {"name": "SEASTREAK",     "prefix": "SEASTREAK",     "gtfs_url": "http://seastreak.com/api/transit/google_transit.zip",                                               "enable_gtfs_static": True},
-    {"name": "VINEYARDFAST",  "prefix": "VINEYARDFAST",  "gtfs_url": "https://data.trilliumtransit.com/gtfs/vineyardfastferry-ri-us/vineyardfastferry-ri-us.zip",         "enable_gtfs_static": True},
-    {"name": "SSA",           "prefix": "SSA",           "gtfs_url": "https://www-steamship-assets.s3.amazonaws.com/versioned_downloadable_forms/path/2025_gtfs_copy1.zip", "enable_gtfs_static": True},
-    # Local bus routes
-    {"name": "LEXPRESS",      "prefix": "LEXPRESS",      "gtfs_url": "http://rtaalerts.com/gtfs/lexpress/google_transit.zip",                                             "enable_gtfs_static": True},
-    # AMTRAK
-    {"name": "AMTRAK",        "prefix": "AMTRAK",        "gtfs_url": "https://content.amtrak.com/content/gtfs/GTFS.zip",                                                   "enable_gtfs_static": True},
-]
+# 3. Snapshot Endpoints
+SNAPSHOT_EPS = env_list("SNAPSHOT_EPS")
 
+# 4. Enhanced Bulk Feeds
+ENHANCED_BULK_STREAMS = {}
+if ENABLE_ENHANCED_STREAMS:
+    if env_text("VEHICLES_ENHANCED_URL"):
+        ENHANCED_BULK_STREAMS["vehicles_enhanced"] = env_text("VEHICLES_ENHANCED_URL")
+    if env_text("ALERTS_ENHANCED_URL"):
+        ENHANCED_BULK_STREAMS["alerts_enhanced"] = env_text("ALERTS_ENHANCED_URL")
+    if env_text("TRIPS_ENHANCED_URL"):
+        ENHANCED_BULK_STREAMS["trips_enhanced"] = env_text("TRIPS_ENHANCED_URL")
 
-#### SHARED RESOURCES ####
+# Tuning Parameters
+DEFAULT_BATCH_SIZE = env_int("DEFAULT_BATCH_SIZE", 25)
+PREDICTIONS_BATCH_SIZE = env_int("PREDICTIONS_BATCH_SIZE", max(DEFAULT_BATCH_SIZE, 75))
+SNAPSHOT_RETRY_MINUTES = env_int("SNAPSHOT_RETRY_MINUTES", 10)
 
-write_queue = queue.Queue(maxsize=1000000)
+# Retry tracking: set to a future datetime when fetch_snapshots has failures; cleared by scheduler.
+_snapshot_retry_lock = threading.Lock()
+_snapshot_retry_at = None  # datetime | None
+ENHANCED_POLL_INTERVAL_SECONDS = env_float("ENHANCED_POLL_INTERVAL_SECONDS", 7)
+ARCHIVE_ZSTD_LEVEL = env_int("ARCHIVE_ZSTD_LEVEL", 10)
+LOG_LEVEL = env_text("LOG_LEVEL", "info").lower() or "info"
+
+# Event-stream parquet retention. Applies only to dated event-stream archives
+# (e.g. AGENCY_vehicles_07012026.parquet) directly under ARCHIVE_DIR. Static
+# GTFS tables live under ARCHIVE_DIR/gtfs/ with stable, non-dated filenames and
+# are never touched by this. Set to 0 (or a negative value) to disable cleanup.
+EVENT_RETENTION_DAYS = env_int("EVENT_RETENTION_DAYS", 30)
+
+write_queue = queue.Queue(maxsize=500000)
 stop_event = threading.Event()
 _http_session = None
+
 
 def get_http_session():
     global _http_session
 
     if _http_session is None:
         session = requests.Session()
+        # Keep retries tight and idempotent (GET only) to avoid duplicate side effects.
         retry = Retry(
             total=3,
             connect=3,
@@ -228,18 +194,25 @@ def get_http_session():
             allowed_methods=frozenset(["GET"]),
             raise_on_status=False,
         )
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
         session.mount("http://", adapter)
         session.mount("https://", adapter)
         _http_session = session
 
     return _http_session
 
+
+def dated_output_filename(stem, extension):
+    date_str = datetime.now(LOCAL_TZ).strftime("%m%d%Y")
+    return f"{AGENCY_PREFIX}_{stem}_{date_str}.{extension}"
+
+
 def filename_date_key(filename):
     try:
         return filename.rsplit("_", 1)[-1].split(".", 1)[0]
     except Exception:
         return ""
+
 
 def close_stale_event_handles(handles, current_date_key):
     stale_filenames = [name for name in handles if filename_date_key(name) != current_date_key]
@@ -248,6 +221,7 @@ def close_stale_event_handles(handles, current_date_key):
             handles[filename].close()
         finally:
             del handles[filename]
+
 
 def gtfs_row_hash(table_name, row_data):
     normalized_row = {}
@@ -262,6 +236,7 @@ def gtfs_row_hash(table_name, row_data):
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+
 def prepare_gtfs_snapshot(df, table_name, logged_date):
     frame = df.copy()
     records = [dict(zip(frame.columns, row)) for row in frame.itertuples(index=False, name=None)]
@@ -269,6 +244,7 @@ def prepare_gtfs_snapshot(df, table_name, logged_date):
     frame["first_logged"] = logged_date
     frame["last_logged"] = logged_date
     return frame
+
 
 def normalize_gtfs_logged_dates(series):
     normalized_values = []
@@ -293,6 +269,7 @@ def normalize_gtfs_logged_dates(series):
         normalized_values.append(parsed)
 
     return pd.Series(normalized_values, index=series.index)
+
 
 def merge_gtfs_snapshots(existing_df, new_df, table_name, logged_date):
     frames = []
@@ -339,15 +316,14 @@ def merge_gtfs_snapshots(existing_df, new_df, table_name, logged_date):
     merged["last_logged"] = normalize_gtfs_logged_dates(merged["last_logged"]).dt.strftime("%Y-%m-%dT%H:%M:%S%z")
     return merged
 
-
 #### LOGGING ####
 
-def log(message, agency_log_label="SYSTEM", is_error=False, is_warning=False):
+def log(message, is_error=False, is_warning=False):
     if LOG_LEVEL == "errors" and not is_error and not is_warning:
         return
         
     ts = datetime.now(LOCAL_TZ).strftime("%H:%M:%S")
-    agency_prefix = f"[{agency_log_label}] " if agency_log_label else ""
+    agency_prefix = f"[{AGENCY_LOG_LABEL}] " if AGENCY_LOG_LABEL else ""
     if is_error:
         print(f"[{ts}] 🔴 ERROR {agency_prefix}{message}".rstrip())
     elif is_warning:
@@ -355,24 +331,24 @@ def log(message, agency_log_label="SYSTEM", is_error=False, is_warning=False):
     else:
         print(f"[{ts}] 🟢 {agency_prefix}{message}".rstrip())
 
-
 #### WRITER & COMPACTION ####
 
 def writer_worker():
-    # Drains the shared queue, computes deduplication hashes, and appends to today's agency JSONL files.
-    log("Unified Writer thread engaged. Streaming to JSONL.")
+    """Drains the queue, computes deduplication hashes, and appends to today's JSONL file."""
+    log("Writer thread engaged. Streaming to JSONL.")
     handles = {}
     
     try:
         while not stop_event.is_set() or not write_queue.empty():
             try:
                 current_date_key = datetime.now(LOCAL_TZ).strftime("%m%d%Y")
+                # Close old file handles immediately after date rollover.
                 close_stale_event_handles(handles, current_date_key)
 
-                agency_prefix, endpoint, evt_type, record_data = write_queue.get(timeout=1.0)
+                endpoint, evt_type, record_data = write_queue.get(timeout=1.0)
                 
                 # Deterministic hash excludes timestamp so deduplication works across days.
-                payload_str = f"{agency_prefix}|{endpoint}|{evt_type}|{record_data.get('id', '')}|{json.dumps(record_data, sort_keys=True)}"
+                payload_str = f"{endpoint}|{evt_type}|{record_data.get('id', '')}|{json.dumps(record_data, sort_keys=True)}"
                 hash_id = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
                 
                 record = {
@@ -383,10 +359,11 @@ def writer_worker():
                     "data": record_data
                 }
                 
-                filename = f"{agency_prefix}_{endpoint}_{current_date_key}.jsonl"
+                filename = dated_output_filename(endpoint, "jsonl")
                 filepath = EVENTS_DIR / filename
                 
                 if filename not in handles:
+                    # Open once per day/file and reuse handle for lower IO overhead.
                     handles[filename] = open(filepath, "a", encoding="utf-8")
                 
                 handles[filename].write(json.dumps(record) + "\n")
@@ -401,28 +378,10 @@ def writer_worker():
         for f in handles.values():
             f.close()
 
-def _align_table_to_schema(table, schema):
-    """Coerce a PyArrow table to the target schema, filling missing columns with nulls."""
-    arrays = []
-    for field in schema:
-        if field.name in table.column_names:
-            col = table.column(field.name)
-            if col.type != field.type:
-                try:
-                    col = col.cast(field.type, safe=False)
-                except Exception:
-                    col = pa.array([None] * len(table), type=field.type)
-        else:
-            col = pa.array([None] * len(table), type=field.type)
-        arrays.append(col)
-    return pa.Table.from_arrays(arrays, schema=schema)
-
-
 def parquet_compaction_worker():
-    # Streams ALL orphaned/yesterday's JSONL files into Parquet and removes the source after success.
+    # Streams orphaned/yesterday's JSONL files into Parquet and removes the source after success.
     # On startup: removes stale .tmp files left by compaction runs that were interrupted by a
-    # container crash. Any .tmp older than 2 hours is safe to delete (a live compaction write
-    # never takes that long).
+    # container crash. Any .tmp older than 2 hours is safe to delete.
     log("Parquet compaction watchdog and recovery sweep active.")
     _STALE_TMP_AGE = 7200  # seconds (2 hours)
     now_ts = time.time()
@@ -446,7 +405,6 @@ def parquet_compaction_worker():
                     log(f"Compacting orphaned/rotated {file.name} to Parquet archive...")
                     temp_path = None
                     writer = None
-                    target_schema = None
                     try:
                         parquet_filename = file.with_suffix(".parquet").name
                         parquet_path = ARCHIVE_DIR / parquet_filename
@@ -469,15 +427,12 @@ def parquet_compaction_worker():
                             table = pa.Table.from_pandas(chunk, preserve_index=False)
 
                             if writer is None:
-                                target_schema = table.schema
                                 writer = pq.ParquetWriter(
                                     str(temp_path),
-                                    target_schema,
+                                    table.schema,
                                     compression="zstd",
                                     compression_level=ARCHIVE_ZSTD_LEVEL,
                                 )
-                            else:
-                                table = _align_table_to_schema(table, target_schema)
 
                             writer.write_table(table)
                             row_count += len(chunk)
@@ -488,6 +443,7 @@ def parquet_compaction_worker():
 
                         writer.close()
                         writer = None
+                        # Atomic replacement avoids partial archives on interruption.
                         temp_path.replace(parquet_path)
                         file.unlink()
                         log(f"Success: {file.name} compacted into {parquet_path.name} with {row_count} rows.")
@@ -509,7 +465,6 @@ def parquet_compaction_worker():
             if stop_event.is_set(): break
             time.sleep(1)
 
-
 # Matches the dated event-stream parquet naming convention, e.g.
 # "MBTA_vehicles_07012026.parquet" -> month=07, day=01, year=2026.
 _EVENT_PARQUET_DATE_RE = re.compile(r"_(\d{2})(\d{2})(\d{4})\.parquet$")
@@ -520,11 +475,10 @@ def cleanup_old_event_parquets():
 
     Only ever considers dated files sitting directly in ARCHIVE_DIR (event streams
     like vehicles, alerts, predictions, stop_events, and the hourly snapshot
-    endpoints, across every agency). Static GTFS tables live in ARCHIVE_DIR/gtfs/
-    under stable, non-dated filenames (AGENCY_gtfs_<table>.parquet); the
-    non-recursive glob below never descends into that subdirectory, and the
-    "_gtfs_" name check below is a second, defensive guard against ever
-    deleting a static table.
+    endpoints). Static GTFS tables live in ARCHIVE_DIR/gtfs/ under stable,
+    non-dated filenames (AGENCY_gtfs_<table>.parquet); the non-recursive glob
+    below never descends into that subdirectory, and the "_gtfs_" name check
+    below is a second, defensive guard against ever deleting a static table.
     """
     if EVENT_RETENTION_DAYS <= 0:
         return
@@ -556,49 +510,49 @@ def cleanup_old_event_parquets():
     if removed:
         log(f"Retention sweep: removed {len(removed)} event parquet(s) older than {EVENT_RETENTION_DAYS} days.")
 
-
 #### NETWORK CONSUMERS ####
 
-def fetch_api_ids(agency, endpoint):
-    # Helper to fetch active route IDs for batching.
-    if not agency.get("base_url"): return []
+def fetch_api_ids(endpoint):
+    """Helper to fetch active route IDs for batching."""
+    if not BASE_URL: return []
     headers = {"Accept": "application/json"}
-    if agency.get("api_key"): headers["X-API-Key"] = agency["api_key"]
+    if API_KEY: headers["X-API-Key"] = API_KEY
     try:
-        res = requests.get(f"{agency['base_url']}/{endpoint}", headers=headers, timeout=15)
+        res = requests.get(f"{BASE_URL}/{endpoint}", headers=headers, timeout=15)
         if res.status_code == 200:
             return [x.get("id") for x in res.json().get("data", []) if x.get("id")]
     except Exception as e:
-        log(f"Failed to fetch {endpoint} IDs: {e}", agency_log_label=agency["prefix"], is_warning=True)
+        log(f"Failed to fetch {endpoint} IDs: {e}", is_warning=True)
     return []
 
-def start_batched_streams(agency, endpoint, routes):
+
+def start_batched_streams(endpoint, routes):
     batch_size = PREDICTIONS_BATCH_SIZE if endpoint == "predictions" else DEFAULT_BATCH_SIZE
     for i in range(0, len(routes), batch_size):
         batch = routes[i:i + batch_size]
         threading.Thread(
             target=sse_consumer,
-            args=(agency, endpoint, {"filter[route]": ",".join(batch)}),
+            args=(endpoint, {"filter[route]": ",".join(batch)}),
             daemon=True,
         ).start()
         time.sleep(0.25)
 
-def sse_consumer(agency, endpoint, params=None):
-    # Maintains a persistent live connection to transit agency SSE endpoints.
-    if not agency.get("base_url"): return
-    url = f"{agency['base_url']}/{endpoint}"
+def sse_consumer(endpoint, params=None):
+    """Maintains a persistent live connection to transit agency SSE endpoints."""
+    if not BASE_URL: return
+    url = f"{BASE_URL}/{endpoint}"
     headers = {
         "Accept": "text/event-stream",
         "Accept-Encoding": "identity",
         "Cache-Control": "no-cache",
     }
-    if agency.get("api_key"): headers["X-API-Key"] = agency["api_key"]
+    if API_KEY: headers["X-API-Key"] = API_KEY
     req_params = params or {}
     session = get_http_session()
     reconnect_delay = 5
 
     while not stop_event.is_set():
-        log(f"Connecting to live stream: /{endpoint} {req_params}", agency_log_label=agency["prefix"])
+        log(f"Connecting to live stream: /{endpoint} {req_params}")
         response = None
         try:
             response = session.get(url, headers=headers, params=req_params, stream=True, timeout=(10, 120))
@@ -609,11 +563,12 @@ def sse_consumer(agency, endpoint, params=None):
             for line in response.iter_lines(decode_unicode=True):
                 if stop_event.is_set(): break
                 if not line:
+                    # Blank line marks one complete SSE event payload.
                     if data_buffer:
                         payload = json.loads("\n".join(data_buffer))
                         records = payload if isinstance(payload, list) else [payload]
                         for r in records:
-                            write_queue.put((agency["prefix"], endpoint, current_event, r))
+                            write_queue.put((endpoint, current_event, r))
                         received_any_data = True
                     current_event = "message"
                     data_buffer = []
@@ -629,22 +584,22 @@ def sse_consumer(agency, endpoint, params=None):
                 time.sleep(reconnect_delay)
                     
         except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as e:
-            log(f"Stream /{endpoint} disconnected: {e}. Reconnecting in {reconnect_delay}s...", agency_log_label=agency["prefix"], is_warning=True)
+            log(f"Stream /{endpoint} disconnected: {e}. Reconnecting in {reconnect_delay}s...", is_warning=True)
             time.sleep(reconnect_delay)
             reconnect_delay = min(60, reconnect_delay * 2)
         except Exception as e:
-            log(f"Stream /{endpoint} disconnected: {e}. Reconnecting in {reconnect_delay}s...", agency_log_label=agency["prefix"], is_warning=True)
+            log(f"Stream /{endpoint} disconnected: {e}. Reconnecting in {reconnect_delay}s...", is_warning=True)
             time.sleep(reconnect_delay)
             reconnect_delay = min(60, reconnect_delay * 2)
         finally:
             if response is not None:
                 response.close()
 
-def enhanced_poller(agency, endpoint, url):
-    # Polls the heavy bulk JSON files based on configured interval.
+def enhanced_poller(endpoint, url):
+    """Polls the heavy bulk JSON files based on configured interval."""
     if not url: return
     headers = {"Accept": "application/json"}
-    if agency.get("api_key"): headers["X-API-Key"] = agency["api_key"]
+    if API_KEY: headers["X-API-Key"] = API_KEY
     
     while not stop_event.is_set():
         try:
@@ -654,44 +609,42 @@ def enhanced_poller(agency, endpoint, url):
                 records = data.get("entity", []) if "entity" in data else data
                 records = records if isinstance(records, list) else [records]
                 for r in records:
-                    write_queue.put((agency["prefix"], endpoint, "update", r))
+                    write_queue.put((endpoint, "update", r))
         except Exception as e:
-            log(f"Enhanced poll failed for {endpoint}: {e}", agency_log_label=agency["prefix"], is_warning=True)
+            log(f"Enhanced poll failed for {endpoint}: {e}", is_warning=True)
             
-        sleep_ticks = int(agency.get("enhanced_poll_interval", 10) * 10)
+        sleep_ticks = int(ENHANCED_POLL_INTERVAL_SECONDS * 10)
         for _ in range(max(10, sleep_ticks)):
             if stop_event.is_set(): break
             time.sleep(0.1)
 
-
 #### SCHEDULER TASKS ####
 
-def fetch_snapshots(agency):
-    # Pulls contextual snapshots for specific agency endpoints.
+def fetch_snapshots():
+    # Pulls contextual snapshots for all configured endpoints.
     # The MBTA V3 API rejects unfiltered requests for several endpoints with HTTP 400.
     # For those endpoints we fetch all route IDs first and pull in batches using
-    # filter[route] — the same approach used to fix trips (Task #29).
-    # Confirmed via curl: schedules, shapes, services, and trips all require filter[route].
+    # filter[route] — confirmed via curl: schedules, shapes, services, and trips all
+    # require filter[route] and return HTTP 400 without it.
     #
     # Retry behavior: each GET is retried up to 3 times on 5xx / connection errors,
-    # with 30s then 60s backoff. If any endpoint still fails after all retries, the
-    # agency is queued for a full retry in SNAPSHOT_RETRY_MINUTES (default 10).
-    if not agency.get("base_url") or not agency.get("snapshot_eps"):
+    # with 30s then 60s backoff. If any endpoint still fails after all retries, a full
+    # retry is scheduled in SNAPSHOT_RETRY_MINUTES (default 10) via the scheduler.
+    global _snapshot_retry_at
+    if not BASE_URL or not ENABLE_SNAPSHOT_PULLS:
         return
-    log("Pulling hourly snapshots...", agency_log_label=agency["prefix"])
+    log("Pulling hourly snapshots...")
     headers = {"Accept": "application/json"}
-    if agency.get("api_key"): headers["X-API-Key"] = agency["api_key"]
+    if API_KEY: headers["X-API-Key"] = API_KEY
 
-    # Endpoints that require filter[route] — all confirmed to return HTTP 400 unfiltered.
-    # Override per-agency via agency["snapshot_eps_require_route_filter"] if needed.
-    REQUIRE_ROUTE_FILTER = set(agency.get("snapshot_eps_require_route_filter", ["trips", "schedules", "shapes", "services"]))
+    # Endpoints confirmed to require filter[route] — fetched in per-route batches.
+    REQUIRE_ROUTE_FILTER = {"trips", "schedules", "shapes", "services"}
 
-    # Endpoints that require a non-route filter, mapped to (source_resource, filter_param).
+    # Endpoints requiring a non-route filter, mapped to (source_resource, filter_param).
     # live_facilities requires filter[id] using facility IDs fetched from /facilities.
-    # Override per-agency via agency["snapshot_eps_require_id_filter"] if needed.
-    REQUIRE_ID_FILTER = agency.get("snapshot_eps_require_id_filter", {
+    REQUIRE_ID_FILTER = {
         "live_facilities": ("facilities", "filter[id]"),
-    })
+    }
 
     # Retry on transient 5xx/connection errors: 3 attempts total with increasing backoff.
     _RETRY_DELAYS = [30, 60]  # seconds before 2nd and 3rd attempt
@@ -711,25 +664,19 @@ def fetch_snapshots(agency):
                     return res
                 if res.status_code < 500:
                     # 4xx errors are configuration problems — don't retry.
-                    log(
-                        f"Snapshot returned HTTP {res.status_code}: {url}",
-                        agency_log_label=agency["prefix"], is_warning=True,
-                    )
+                    log(f"Snapshot returned HTTP {res.status_code}: {url}", is_warning=True)
                     return None
                 err_msg = f"HTTP {res.status_code}"
 
             is_last = attempt >= len(_RETRY_DELAYS)
             if is_last:
-                log(
-                    f"Snapshot failed ({err_msg}), all {max_attempts} attempts exhausted: {url}",
-                    agency_log_label=agency["prefix"], is_warning=True,
-                )
+                log(f"Snapshot failed ({err_msg}), all {max_attempts} attempts exhausted: {url}", is_warning=True)
                 return None
             delay = _RETRY_DELAYS[attempt]
             log(
                 f"Snapshot failed ({err_msg}), retrying in {delay}s "
                 f"(attempt {attempt + 1}/{max_attempts}): {url}",
-                agency_log_label=agency["prefix"], is_warning=True,
+                is_warning=True,
             )
             # Interruptible sleep so the container shuts down cleanly.
             for _ in range(delay):
@@ -741,7 +688,7 @@ def fetch_snapshots(agency):
     any_failed = False
     endpoint_counts = {}  # endpoint -> record count written (None = failed)
 
-    for endpoint in agency.get("snapshot_eps", []):
+    for endpoint in SNAPSHOT_EPS:
         if stop_event.is_set():
             break
         count = 0
@@ -749,62 +696,54 @@ def fetch_snapshots(agency):
         try:
             if endpoint in REQUIRE_ROUTE_FILTER:
                 # Fetch route IDs then pull per-route batch to satisfy the API filter requirement.
-                route_ids = fetch_api_ids(agency, "routes")
+                route_ids = fetch_api_ids("routes")
                 if not route_ids:
-                    log(
-                        f"Skipping {endpoint} snapshot: could not retrieve route IDs",
-                        agency_log_label=agency["prefix"], is_warning=True,
-                    )
+                    log(f"Skipping {endpoint} snapshot: could not retrieve route IDs", is_warning=True)
                     any_failed = True
                     endpoint_counts[endpoint] = None
                     continue
-                batch_size = DEFAULT_BATCH_SIZE
-                for i in range(0, len(route_ids), batch_size):
+                for i in range(0, len(route_ids), DEFAULT_BATCH_SIZE):
                     if stop_event.is_set():
                         break
-                    batch = route_ids[i : i + batch_size]
+                    batch = route_ids[i : i + DEFAULT_BATCH_SIZE]
                     res = _get_with_retry(
-                        f"{agency['base_url']}/{endpoint}",
+                        f"{BASE_URL}/{endpoint}",
                         params={"filter[route]": ",".join(batch)},
                     )
                     if res is not None:
                         for r in res.json().get("data", []):
-                            write_queue.put((agency["prefix"], endpoint, "snapshot", r))
+                            write_queue.put((endpoint, "snapshot", r))
                             count += 1
                     else:
                         ep_failed = True
             elif endpoint in REQUIRE_ID_FILTER:
                 # Fetch resource IDs first, then batch using the endpoint-specific filter param.
                 source_resource, filter_param = REQUIRE_ID_FILTER[endpoint]
-                ids = fetch_api_ids(agency, source_resource)
+                ids = fetch_api_ids(source_resource)
                 if not ids:
-                    log(
-                        f"Skipping {endpoint} snapshot: could not retrieve {source_resource} IDs",
-                        agency_log_label=agency["prefix"], is_warning=True,
-                    )
+                    log(f"Skipping {endpoint} snapshot: could not retrieve {source_resource} IDs", is_warning=True)
                     any_failed = True
                     endpoint_counts[endpoint] = None
                     continue
-                batch_size = DEFAULT_BATCH_SIZE
-                for i in range(0, len(ids), batch_size):
+                for i in range(0, len(ids), DEFAULT_BATCH_SIZE):
                     if stop_event.is_set():
                         break
-                    batch = ids[i : i + batch_size]
+                    batch = ids[i : i + DEFAULT_BATCH_SIZE]
                     res = _get_with_retry(
-                        f"{agency['base_url']}/{endpoint}",
+                        f"{BASE_URL}/{endpoint}",
                         params={filter_param: ",".join(batch)},
                     )
                     if res is not None:
                         for r in res.json().get("data", []):
-                            write_queue.put((agency["prefix"], endpoint, "snapshot", r))
+                            write_queue.put((endpoint, "snapshot", r))
                             count += 1
                     else:
                         ep_failed = True
             else:
-                res = _get_with_retry(f"{agency['base_url']}/{endpoint}")
+                res = _get_with_retry(f"{BASE_URL}/{endpoint}")
                 if res is not None:
                     for r in res.json().get("data", []):
-                        write_queue.put((agency["prefix"], endpoint, "snapshot", r))
+                        write_queue.put((endpoint, "snapshot", r))
                         count += 1
                 else:
                     ep_failed = True
@@ -821,33 +760,26 @@ def fetch_snapshots(agency):
     ok = [f"{ep}={ct}" for ep, ct in endpoint_counts.items() if ct is not None]
     fail = [ep for ep, ct in endpoint_counts.items() if ct is None]
     if ok:
-        log(f"Snapshots OK: {', '.join(ok)}", agency_log_label=agency["prefix"])
+        log(f"Snapshots OK: {', '.join(ok)}")
     if fail:
-        log(f"Snapshots FAILED: {', '.join(fail)}", agency_log_label=agency["prefix"], is_warning=True)
+        log(f"Snapshots FAILED: {', '.join(fail)}", is_warning=True)
 
     if any_failed and not stop_event.is_set():
-        retry_after = datetime.now(LOCAL_TZ) + timedelta(minutes=SNAPSHOT_RETRY_MINUTES)
         with _snapshot_retry_lock:
-            _snapshot_retry_queue[agency["prefix"]] = (retry_after, agency)
-        log(
-            f"Some snapshots failed — scheduled retry in {SNAPSHOT_RETRY_MINUTES} min",
-            agency_log_label=agency["prefix"], is_warning=True,
-        )
+            _snapshot_retry_at = datetime.now(LOCAL_TZ) + timedelta(minutes=SNAPSHOT_RETRY_MINUTES)
+        log(f"Some snapshots failed — scheduled retry in {SNAPSHOT_RETRY_MINUTES} min", is_warning=True)
 
-def fetch_gtfs_static(agency, skip_if_cached=False):
+def fetch_gtfs_static(skip_if_cached=False):
     # Downloads GTFS zip, deduplicates rows, and updates first/last seen dates.
-    # skip_if_cached=True (startup): skips the download if parquet files already exist
-    # for this agency — they'll be refreshed at the next scheduled 3AM/3PM run instead.
-    if not agency.get("gtfs_url"):
+    # skip_if_cached=True (startup): skips if parquet files already exist for this agency —
+    # they'll be refreshed at the next scheduled 3AM/3PM run instead.
+    if not GTFS_URL or not ENABLE_GTFS_STATIC:
         return
-
-    prefix = agency["prefix"]
-    if skip_if_cached and list(GTFS_DIR.glob(f"{prefix}_gtfs_*.parquet")):
+    if skip_if_cached and list(GTFS_DIR.glob(f"{AGENCY_PREFIX}_gtfs_*.parquet")):
         return
-
-    log("Pulling static GTFS assets...", agency_log_label=prefix)
+    log("Pulling static GTFS assets...")
     try:
-        res = requests.get(agency["gtfs_url"], headers=GTFS_DOWNLOAD_HEADERS, timeout=120)
+        res = requests.get(GTFS_URL, headers=GTFS_DOWNLOAD_HEADERS, timeout=120)
         res.raise_for_status()
         
         logged_at = datetime.now(LOCAL_TZ).isoformat(timespec="seconds")
@@ -858,14 +790,14 @@ def fetch_gtfs_static(agency, skip_if_cached=False):
                 table_name = file_name.replace(".txt", "")
                 
                 df = pd.read_csv(z.open(file_name), dtype=str, low_memory=False)
-                out_path = GTFS_DIR / f"{prefix}_gtfs_{table_name}.parquet"
+                out_path = GTFS_DIR / f"{AGENCY_PREFIX}_gtfs_{table_name}.parquet"
 
                 current_df = prepare_gtfs_snapshot(df, table_name, logged_at)
                 existing_df = pd.read_parquet(out_path) if out_path.exists() else None
                 merged_df = merge_gtfs_snapshots(existing_df, current_df, table_name, logged_at)
 
                 if merged_df is None:
-                    log(f"Skipping empty GTFS table: {table_name}", agency_log_label=prefix, is_warning=True)
+                    log(f"Skipping empty GTFS table: {table_name}", is_warning=True)
                     continue
 
                 temp_path = out_path.with_name(f"{out_path.name}.tmp")
@@ -876,79 +808,71 @@ def fetch_gtfs_static(agency, skip_if_cached=False):
                 pq.write_table(table, temp_path, compression="zstd", compression_level=ARCHIVE_ZSTD_LEVEL)
                 temp_path.replace(out_path)
                 
-        log("Static GTFS update complete.", agency_log_label=prefix)
+        log("Static GTFS update complete.")
     except Exception as e:
-        log(f"GTFS pull failed: {e}", agency_log_label=prefix, is_error=True)
+        log(f"GTFS pull failed: {e}", is_error=True)
 
 def scheduler_thread():
-    # Triggers hourly and daily automated tasks for all agencies using ThreadPoolExecutor.
-    # Also drains _snapshot_retry_queue: agencies with failed snapshots are retried after
-    # SNAPSHOT_RETRY_MINUTES rather than waiting until the next top-of-hour run.
+    # Triggers hourly and daily automated tasks.
+    # Also drains _snapshot_retry_at: if fetch_snapshots had failures it schedules a retry
+    # after SNAPSHOT_RETRY_MINUTES rather than waiting until the next top-of-hour run.
+    global _snapshot_retry_at
     last_snapshot_hour = -1
     last_gtfs_pull = -1
-    executor = ThreadPoolExecutor(max_workers=4)
 
     while not stop_event.is_set():
         now = datetime.now(LOCAL_TZ)
 
-        # Hourly REST Snapshots
-        if now.hour != last_snapshot_hour and now.minute == 0:
-            for agency in AGENCIES:
-                if agency.get("enable_snapshot_pulls"):
-                    executor.submit(fetch_snapshots, agency)
+        if ENABLE_SNAPSHOT_PULLS and now.hour != last_snapshot_hour and now.minute == 0:
+            threading.Thread(target=fetch_snapshots, daemon=True).start()
             last_snapshot_hour = now.hour
 
         # Retry snapshots that failed in a previous run (sooner than next top-of-hour).
         with _snapshot_retry_lock:
-            due = [(prefix, retry_at, ag) for prefix, (retry_at, ag) in _snapshot_retry_queue.items() if now >= retry_at]
-            for prefix, _, _ in due:
-                del _snapshot_retry_queue[prefix]
-        for prefix, _, ag in due:
-            log(f"Retrying failed snapshots", agency_log_label=prefix)
-            executor.submit(fetch_snapshots, ag)
+            due = _snapshot_retry_at is not None and now >= _snapshot_retry_at
+            if due:
+                _snapshot_retry_at = None
+        if due:
+            log("Retrying failed snapshots")
+            threading.Thread(target=fetch_snapshots, daemon=True).start()
 
-        # Static GTFS Pulls at 3AM and 3PM
-        if now.hour in [3, 15] and now.hour != last_gtfs_pull:
-            for agency in AGENCIES:
-                if agency.get("enable_gtfs_static"):
-                    executor.submit(fetch_gtfs_static, agency)
+        if ENABLE_GTFS_STATIC and now.hour in [3, 15] and now.hour != last_gtfs_pull:
+            threading.Thread(target=fetch_gtfs_static, daemon=True).start()
             last_gtfs_pull = now.hour
 
         time.sleep(10)
-
 
 #### MAIN ORCHESTRATOR ####
 
 if __name__ == "__main__":
     try:
-        log("Starting Unified Transit Ingestion Engine...")
+        log("Starting transit ingestion engine...")
         
         threading.Thread(target=writer_worker, daemon=True).start()
         threading.Thread(target=parquet_compaction_worker, daemon=True).start()
-        threading.Thread(target=scheduler_thread, daemon=True).start()
+        if ENABLE_SNAPSHOT_PULLS or ENABLE_GTFS_STATIC:
+            threading.Thread(target=scheduler_thread, daemon=True).start()
         
-        for agency in AGENCIES:
-            # Initial baseline pulls
-            if agency.get("enable_snapshot_pulls"):
-                threading.Thread(target=fetch_snapshots, args=(agency,), daemon=True).start()
-            if agency.get("enable_gtfs_static"):
-                threading.Thread(target=fetch_gtfs_static, args=(agency,), kwargs={"skip_if_cached": True}, daemon=True).start()
-            
-            # Deploy Base Streams
-            if agency.get("enable_base_streams"):
-                for endpoint in agency.get("base_streams", []):
-                    threading.Thread(target=sse_consumer, args=(agency, endpoint), daemon=True).start()
-                    
-                # Deploy Route-Batched Streams
-                if agency.get("enable_route_streams"):
-                    routes = fetch_api_ids(agency, "routes")
-                    for endpoint in agency.get("route_streams", []):
-                        start_batched_streams(agency, endpoint, routes)
-                        
-            # Deploy Enhanced Pollers
-            if agency.get("enable_enhanced_streams"):
-                for endpoint, url in agency.get("enhanced_streams", {}).items():
-                    threading.Thread(target=enhanced_poller, args=(agency, endpoint, url), daemon=True).start()
+        # Initial baseline pulls
+        if BASE_URL and ENABLE_SNAPSHOT_PULLS:
+            threading.Thread(target=fetch_snapshots, daemon=True).start()
+        if GTFS_URL and ENABLE_GTFS_STATIC:
+            threading.Thread(target=fetch_gtfs_static, kwargs={"skip_if_cached": True}, daemon=True).start()
+        
+        # Deploy Base Streams
+        if BASE_URL and ENABLE_BASE_STREAMS:
+            for endpoint in BASE_STREAMS:
+                threading.Thread(target=sse_consumer, args=(endpoint,), daemon=True).start()
+                
+            # Deploy Route-Batched Streams
+            if ENABLE_ROUTE_STREAMS:
+                routes = fetch_api_ids("routes")
+                for endpoint in ROUTE_STREAMS:
+                    start_batched_streams(endpoint, routes)
+                
+        # Deploy Enhanced Pollers
+        for endpoint, url in ENHANCED_BULK_STREAMS.items():
+            threading.Thread(target=enhanced_poller, args=(endpoint, url), daemon=True).start()
             
         while not stop_event.is_set():
             time.sleep(1)
