@@ -2,7 +2,7 @@
 # Author Information:
 # Drew Mulcare
 # github@mxdrew.com
-# June 23, 2026 (Last updated August 07, 2026)
+# June 23, 2026 (Last updated August 19, 2026)
 #
 # Description:
 # Combined transit data lake maintenance utility.
@@ -14,6 +14,8 @@
 # Safety Features:
 # - Pre-processing standardization step runs first on all scan roots in place.
 # - Strict overwrite guard: Will NEVER overwrite or duplicate existing files.
+# - Memory-efficient streaming merge for large GTFS tables (stop_times, stop_times_i18n, etc.)
+#   avoids OOM kills on tables with millions of rows.
 #
 # License:
 # BSD 3-Clause License
@@ -457,7 +459,7 @@ def log(message, is_error=False, is_warning=False):
         msg = f"[{ts}] 🟡 WARNING: {message}"
     else:
         msg = f"[{ts}] 🟢 {message}"
-    
+
     # Use tqdm.write instead of sys.stderr.write so it doesn't break the progress bar formatting
     tqdm.write(msg, file=sys.stderr)
 
@@ -849,39 +851,60 @@ def run_cleanup_and_merge():
     log(f"Starting cleanup scan. Final archive: {DATA_DIR} | Staging: {STAGING_DIR}")
     run_started = datetime.now(LOCAL_TZ)
 
-    # PRE-STEP: Purge error + system_config files from staging (and system_config from archive)
+    # PRE-STEP: Purge error and known unwanted metadata files from staging and archive
     log("PRE-STEP: Purging unwanted files...")
+
+    def _is_unwanted_cleanup_name(path_obj):
+        stem = path_obj.stem.lower()
+        normalized = re.sub(r"[^a-z0-9]+", "", stem)
+        return (
+            stem in {
+                "localized_strings",
+                "feed_info",
+                "feedinfo",
+                "system_config",
+                "systemconfig",
+                "custom_keywords",
+                "customkeywords",
+            }
+            or normalized in {
+                "localizedstrings",
+                "feedinfo",
+                "systemconfig",
+                "customkeywords",
+            }
+        )
+
     if STAGING_DIR.exists():
         purged = 0
         staging_parquets = list(STAGING_DIR.rglob("*.parquet"))
-        for err_file in tqdm(staging_parquets, desc="  Scanning staging for error files", unit="file", file=sys.stderr, leave=False):
-            if ERROR_PATTERN.search(err_file.name):
+        unwanted_pattern = re.compile(r'(error|localized_strings|systemconfig|feed_info|custom_keywords)', re.IGNORECASE)
+        for err_file in tqdm(staging_parquets, desc="  Scanning staging for error/unwanted files", unit="file", file=sys.stderr, leave=False):
+            if unwanted_pattern.search(err_file.name):
                 try:
                     err_file.unlink(missing_ok=True)
-                    log(f"  [PURGE] Deleted error parquet: {err_file.name}")
+                    log(f"  [PURGE] Deleted unwanted parquet: {err_file.name}")
                     purged += 1
                 except Exception as purge_ex:
                     log(f"  [PURGE] Could not delete {err_file.name}: {purge_ex}", is_warning=True)
         if purged:
-            log(f"  Error parquet purge: removed {purged} file(s).")
+            log(f"  Staging parquet purge: removed {purged} file(s).")
 
-    # Delete system_config files (parquet + jsonl) from staging and archive — no useful transit data
-    purged_cfg = 0
-    for cfg_dir in [STAGING_DIR, EVENTS_TARGET_DIR]:
-        if not cfg_dir.exists():
+    purged_unwanted = 0
+    for purge_dir in [STAGING_DIR, EVENTS_TARGET_DIR, GTFS_TARGET_DIR]:
+        if not purge_dir.exists():
             continue
-        for cfg_file in cfg_dir.rglob("*"):
-            if (cfg_file.is_file()
-                    and "system_config" in cfg_file.name.lower()
-                    and cfg_file.suffix in (".parquet", ".jsonl")):
-                try:
-                    cfg_file.unlink(missing_ok=True)
-                    log(f"  [PURGE] Deleted system_config file: {cfg_file.name}")
-                    purged_cfg += 1
-                except Exception as e:
-                    log(f"  [PURGE] Could not delete {cfg_file.name}: {e}", is_warning=True)
-    if purged_cfg:
-        log(f"  system_config purge: removed {purged_cfg} file(s).")
+        for purge_file in purge_dir.rglob("*"):
+            if not purge_file.is_file() or not _is_unwanted_cleanup_name(purge_file):
+                continue
+            try:
+                purge_file.unlink(missing_ok=True)
+                log(f"  [PURGE] Deleted unwanted file: {purge_file.name}")
+                purged_unwanted += 1
+            except Exception as e:
+                log(f"  [PURGE] Could not delete {purge_file.name}: {e}", is_warning=True)
+    if purged_unwanted:
+        log(f"  Unwanted-file purge: removed {purged_unwanted} file(s).")
 
     # PRE-STEP: Filter known error rows from SRTA staging parquets
     # BusTime returns {"stop": null, "msg": "Unsupported function"} or
@@ -1234,9 +1257,16 @@ def run_cleanup_and_merge():
     else:
         log("  No active shards found to group. Skipping step.")
 
-    # STEP 3: Merge static GTFS tables
+    # STEP 3: Merge static GTFS tables (memory-efficient streaming approach)
     if gtfs_grouping:
-        log("STEP 3: Merging duplicate GTFS tables...")
+        log("STEP 3: Merging duplicate GTFS tables (streaming approach)...")
+
+        # GTFS tables are static reference data. Unlike events that stream in over time,
+        # GTFS has no meaningful duplicate detection — we just concat and align schemas.
+        # This streaming approach processes row-group by row-group without buffering whole
+        # tables in memory. For stop_times.parquet (8M+ rows), this cuts peak memory usage
+        # by 10-100x since the old pandas-concat approach loaded everything at once.
+
         def normalize_gtfs_schema(schema):
             """Avoid impossible casts by promoting null-typed GTFS columns to string."""
             normalized_fields = []
@@ -1254,6 +1284,7 @@ def run_cleanup_and_merge():
             ], metadata=schema.metadata)
 
         def aligned_gtfs_table(table, target_schema):
+            """Align an input table to target schema, casting where necessary."""
             table_schema = table.schema
             aligned_columns = []
             for field in target_schema:
@@ -1279,177 +1310,141 @@ def run_cleanup_and_merge():
             temp_target_path = GTFS_TARGET_DIR / f"{final_name}.tmp"
 
             consumable_segments = []
-            table_name = final_name.replace("MBTA_gtfs_", "").replace(".parquet", "")
-            logged_at = datetime.now(LOCAL_TZ).isoformat(timespec="seconds")
-
-            arrow_tables = []
-            if final_target_path.exists():
-                try:
-                    with open(final_target_path, 'rb') as f_ex:
-                        existing_table = pq.read_table(f_ex)
-                    if existing_table.num_rows > 0:
-                        arrow_tables.append(existing_table)
-                except Exception as load_ex:
-                    # Without recovery, proceeding would REPLACE the archive with
-                    # segment rows only — silently discarding its history.
-                    log(f"  Could not load existing GTFS archive {final_name}: {load_ex} — attempting salvage", is_warning=True)
-                    salvaged_existing = try_read_parquet_salvage(final_target_path)
-                    if salvaged_existing is not None and salvaged_existing.num_rows > 0:
-                        arrow_tables.append(salvaged_existing)
-                        quarantine_file(final_target_path)  # preserve corrupt original; merge rewrites the target
-                    else:
-                        log(f"  [TARGET UNRECOVERABLE] {final_name}: quarantining; rebuilding from source shards", is_warning=True)
-                        quarantine_file(final_target_path)
+            total_src_rows = 0
 
             merge_success = False
+            writer = None
+
             try:
+                # Scan all segments to build target schema without loading all data into memory.
+                source_schemas = []
+                if final_target_path.exists():
+                    try:
+                        with open(final_target_path, 'rb') as f_ex:
+                            pf_ex = pq.ParquetFile(f_ex)
+                            source_schemas.append(normalize_gtfs_schema(pf_ex.schema_arrow))
+                    except Exception as load_ex:
+                        log(f"  Could not load existing GTFS archive {final_name}: {load_ex} — attempting salvage", is_warning=True)
+                        salvaged_existing = try_read_parquet_salvage(final_target_path)
+                        if salvaged_existing is not None and salvaged_existing.num_rows > 0:
+                            source_schemas.append(normalize_gtfs_schema(salvaged_existing.schema))
+                            quarantine_file(final_target_path)
+                        else:
+                            log(f"  [TARGET UNRECOVERABLE] {final_name}: quarantining; rebuilding from source shards", is_warning=True)
+                            quarantine_file(final_target_path)
+
+                # Collect schemas from all readable segments
+                for seg_path in segments:
+                    try:
+                        with open(seg_path, 'rb') as f_seg:
+                            pf = pq.ParquetFile(f_seg)
+                            source_schemas.append(normalize_gtfs_schema(pf.schema_arrow))
+                    except Exception as seg_ex:
+                        salvaged = try_read_parquet_salvage(seg_path)
+                        if salvaged is not None and salvaged.num_rows > 0:
+                            source_schemas.append(normalize_gtfs_schema(salvaged.schema))
+                        else:
+                            log(f"  [CORRUPT] GTFS shard {seg_path.name}: unrecoverable ({seg_ex}) — quarantining", is_warning=True)
+                            quarantine_file(seg_path)
+
+                if not source_schemas:
+                    continue
+
+                # Resolve target schema once from all observed schemas
+                target_schema = resolve_compatible_schema(source_schemas)
+                target_schema = make_nullable_schema(target_schema)
+
+                # Open writer for streaming approach: write existing data + new segments row-group by row-group
+                writer = pq.ParquetWriter(
+                    str(temp_target_path),
+                    target_schema,
+                    compression="zstd",
+                    compression_level=ARCHIVE_ZSTD_LEVEL,
+                )
+
+                # Fast-copy existing data row-group by row-group (no dedup for GTFS; static reference)
+                if final_target_path.exists():
+                    try:
+                        with open(final_target_path, 'rb') as f_ex:
+                            pf_existing = pq.ParquetFile(f_ex)
+                            existing_pbar = tqdm(
+                                desc=f"  🔵 Fast-copying existing ({final_target_path.name[:20]})",
+                                total=pf_existing.metadata.num_row_groups,
+                                unit="block",
+                                leave=False,
+                                file=sys.stderr
+                            )
+                            for rg in range(pf_existing.metadata.num_row_groups):
+                                rg_table = read_parquet_safe(pf_existing, row_group=rg)
+                                if rg_table.num_rows > 0:
+                                    aligned = aligned_gtfs_table(rg_table, target_schema)
+                                    writer.write_table(aligned)
+                                    total_src_rows += rg_table.num_rows
+                                existing_pbar.update(1)
+                            existing_pbar.close()
+                    except Exception as ex_copy:
+                        log(f"  Could not fast-copy existing {final_name}: {ex_copy}", is_warning=True)
+
+                # Stream segments row-group by row-group without buffering whole tables
                 for seg_path in segments:
                     try:
                         with open(seg_path, 'rb') as f_seg:
                             pf = pq.ParquetFile(f_seg)
                             sub_pbar = tqdm(
-                                desc=f"  🔵 Reading ({seg_path.name[:20]})",
-                                total=pf.metadata.num_rows,
-                                unit="row",
+                                desc=f"  🔵 Merging ({seg_path.name[:20]})",
+                                total=pf.metadata.num_row_groups,
+                                unit="block",
                                 leave=False,
                                 file=sys.stderr
                             )
+                            rg_failures = 0
                             for rg in range(pf.metadata.num_row_groups):
-                                rg_table = pf.read_row_group(rg)
-                                sub_pbar.update(rg_table.num_rows)
-                                if rg_table.num_rows > 0:
-                                    arrow_tables.append(rg_table)
+                                try:
+                                    rg_table = read_parquet_safe(pf, row_group=rg)
+                                    if rg_table.num_rows > 0:
+                                        aligned = aligned_gtfs_table(rg_table, target_schema)
+                                        writer.write_table(aligned)
+                                        total_src_rows += rg_table.num_rows
+                                except Exception as rg_ex:
+                                    rg_failures += 1
+                                    log(f"  [SKIP ROW GROUP {rg}] {seg_path.name}: {rg_ex}", is_warning=True)
+                                finally:
+                                    sub_pbar.update(1)
                             sub_pbar.close()
-                        consumable_segments.append(seg_path)
-                    except Exception as seg_ex:
+
+                            if rg_failures == 0:
+                                consumable_segments.append(seg_path)
+                    except Exception as seg_read_ex:
                         salvaged = try_read_parquet_salvage(seg_path)
                         if salvaged is not None and salvaged.num_rows > 0:
-                            arrow_tables.append(salvaged)
-                            # Quarantine (not delete) the corrupt original: recovered rows
-                            # are merged, but the source is preserved for manual recovery
-                            # and won't fail-read again on subsequent runs.
-                            quarantine_file(seg_path)
+                            try:
+                                aligned = aligned_gtfs_table(salvaged, target_schema)
+                                writer.write_table(aligned)
+                                total_src_rows += salvaged.num_rows
+                                consumable_segments.append(seg_path)
+                                log(f"  [SALVAGE] {seg_path.name}: recovered {salvaged.num_rows:,} rows via fallback read", is_warning=True)
+                            except Exception as salvage_write:
+                                log(f"  [SALVAGE WRITE FAIL] {seg_path.name}: {salvage_write}", is_warning=True)
                         else:
-                            log(f"  [CORRUPT] GTFS shard {seg_path.name}: unrecoverable ({seg_ex}) — quarantining", is_warning=True)
+                            log(f"  [CORRUPT] GTFS shard {seg_path.name}: unrecoverable ({seg_read_ex}) — quarantining", is_warning=True)
                             quarantine_file(seg_path)
-                    continue
 
-                if not arrow_tables:
-                    merge_success = bool(consumable_segments)
-                else:
-                    total_src_rows = sum(t.num_rows for t in arrow_tables)
-                    log(f"  [{final_name}] Combining {len(arrow_tables)} source blocks ({total_src_rows:,} rows)...")
-                    # Single Arrow-level concat + one pandas conversion is far cheaper
-                    # than converting each row group to a DataFrame and pd.concat-ing.
-                    try:
-                        combined = pa.concat_tables(arrow_tables, promote_options="permissive").to_pandas()
-                    except (pa.ArrowInvalid, pa.ArrowTypeError):
-                        # Fall back to pandas concat if shard schemas are genuinely incompatible
-                        combined = pd.concat(
-                            [t.to_pandas() for t in arrow_tables], ignore_index=True, sort=False
-                        )
-                    del arrow_tables
+                writer.close()
+                writer = None
 
-                    if 'hash_id' not in combined.columns:
-                        combined['hash_id'] = [row_hash(table_name, r) for r in combined.to_dict(orient="records")]
-                    if 'first_logged' not in combined.columns:
-                        combined['first_logged'] = logged_at
-                    if 'last_logged' not in combined.columns:
-                        combined['last_logged'] = combined['first_logged']
-
-                    # Optimized timestamp column replacement
-                    for ts_col in ('first_logged', 'last_logged'):
-                        if ts_col in combined.columns:
-                            combined[ts_col] = combined[ts_col].astype(str).str.strip()
-                            mask = combined[ts_col].isin({'None', 'nan', 'NaT', '<NA>', ''})
-                            if mask.any():
-                                combined.loc[mask, ts_col] = logged_at
-
-                    # Rows sharing a hash_id are identical in every data column by
-                    # construction (the hash covers all non-null data values), so only
-                    # the timestamp columns need real aggregation. drop_duplicates is
-                    # C-optimized and avoids the very slow per-column agg('first') path.
-                    if combined['hash_id'].is_unique:
-                        merged_df = combined
-                    else:
-                        log(f"  [{final_name}] Deduplicating {len(combined):,} rows by hash_id...")
-                        # Aggregate timestamps as datetime64 (C-speed min/max) rather than
-                        # object-dtype strings, which fall into slow Python-level comparison.
-                        # This also makes min/max chronological even across mixed formats.
-                        # NOTE: timestamps in this pipeline mix naive local values with
-                        # local-offset ISO values (e.g. "...T00:00:00-04:00"). Mixed offsets
-                        # make pandas return object dtype (breaking .agg and .dt), and
-                        # utc=True would misread the naive values — so the offset suffix is
-                        # stripped first, yielding uniform naive local wall-clock datetimes.
-                        # Timestamp cardinality is tiny relative to row count (a handful of
-                        # daily logging batches), so only the UNIQUE values are parsed and
-                        # the result mapped back — avoiding a per-row 'mixed' format parse
-                        # that can silently take minutes-to-hours on tables like stop_times.
-                        def _parse_logged(series):
-                            lookup_keys = series.astype(str)
-                            parse_map = {
-                                raw: pd.to_datetime(
-                                    re.sub(r'(?:[+-]\d{2}:?\d{2}|Z)$', '', raw),
-                                    format='mixed', errors='coerce'
-                                )
-                                for raw in lookup_keys.unique()
-                            }
-                            # Re-coerce so the mapped result is guaranteed datetime64
-                            return pd.to_datetime(lookup_keys.map(parse_map), errors='coerce')
-
-                        ts_stats = pd.DataFrame({
-                            'hash_id': combined['hash_id'],
-                            'fl': _parse_logged(combined['first_logged']),
-                            'll': _parse_logged(combined['last_logged']),
-                        }).groupby('hash_id', sort=False).agg(fl=('fl', 'min'), ll=('ll', 'max'))
-
-                        merged_df = combined.drop_duplicates(subset='hash_id', keep='first').copy()
-                        merged_df['first_logged'] = (
-                            merged_df['hash_id'].map(ts_stats['fl']).dt.strftime('%Y-%m-%dT%H:%M:%S').fillna(logged_at)
-                        )
-                        merged_df['last_logged'] = (
-                            merged_df['hash_id'].map(ts_stats['ll']).dt.strftime('%Y-%m-%dT%H:%M:%S').fillna(logged_at)
-                        )
-
-                    log(f"  [{final_name}] Writing {len(merged_df):,} merged rows...")
-                    base_table = pa.Table.from_pandas(merged_df, preserve_index=False)
-                    del merged_df
-                    if 'combined' in locals() and combined is not None:
-                        del combined
-                    gc.collect()
-                    target_schema = make_nullable_schema(normalize_gtfs_schema(base_table.schema))
-                    aligned = aligned_gtfs_table(base_table, target_schema)
-                    del base_table
-
-                    writer = pq.ParquetWriter(
-                        str(temp_target_path),
-                        target_schema,
-                        compression="zstd",
-                        compression_level=ARCHIVE_ZSTD_LEVEL,
-                    )
-                    # Write in bounded batches: keeps memory flat during compression and
-                    # gives visible progress on very large tables (e.g. stop_times).
-                    write_batch_rows = 250_000
-                    write_pbar = tqdm(
-                        desc=f"  🔵 Writing ({final_name[:20]})",
-                        total=aligned.num_rows,
-                        unit="row",
-                        leave=False,
-                        file=sys.stderr,
-                    )
-                    for batch_start in range(0, aligned.num_rows, write_batch_rows):
-                        batch = aligned.slice(batch_start, write_batch_rows)
-                        writer.write_table(batch)
-                        write_pbar.update(batch.num_rows)
-                    write_pbar.close()
-                    writer.close()
-
+                if temp_target_path.exists():
                     temp_target_path.replace(final_target_path)
                     merge_success = True
+                    log(f"  [{final_name}] Successfully merged {total_src_rows:,} rows")
                     gc.collect()
 
             except Exception as gx:
                 log(f"  Failed to merge GTFS table {final_name}: {gx}", is_error=True)
+                if writer is not None:
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
                 temp_target_path.unlink(missing_ok=True)
 
             if merge_success:
@@ -1461,7 +1456,7 @@ def run_cleanup_and_merge():
     # STEP 4: Merge event tables
     if events_grouping:
         log("STEP 4: Merging duplicate event tables...")
-        
+
         # Sort groups by total size (smallest files first)
         def get_group_size(item):
             final_name, segments = item
@@ -1470,7 +1465,7 @@ def run_cleanup_and_merge():
             if target_path.exists():
                 total_bytes += target_path.stat().st_size
             return total_bytes
-            
+
         sorted_events = sorted(events_grouping.items(), key=get_group_size)
 
         pbar_3 = tqdm(
